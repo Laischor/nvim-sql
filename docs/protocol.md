@@ -30,12 +30,15 @@ maintenance database (postgres) or `main` (sqlite). The returned `id`
 
 ### `disconnect {id}` → `{ok}`
 
-### `query {id, sql, max_rows?}` → result
+### `query {id, sql, max_rows?, params?}` → result
 ```
 {columns: [{name, type}], rows: [[...]], row_count, more,
  rows_affected, duration_ms}
 ```
 - `max_rows` defaults to 500; `more: true` means the result was truncated.
+- `params` are positional (`$1…` postgres, `?` sqlite) and must be strings
+  or null — servers cast text to the column type. Used by the edit grid so
+  values are never concatenated into SQL.
 - Cell values are JSON null/bool/number/string; timestamps and byte arrays are
   stringified, json/array columns keep their structure.
 - Statements without a result set return empty `columns` and `rows_affected`.

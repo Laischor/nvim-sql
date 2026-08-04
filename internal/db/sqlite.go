@@ -56,10 +56,10 @@ func returnsRows(sqlText string) bool {
 	return returningRe.MatchString(sqlText)
 }
 
-func (c *SQLiteConn) Query(ctx context.Context, sqlText string, maxRows int) (*Result, error) {
+func (c *SQLiteConn) Query(ctx context.Context, sqlText string, params []any, maxRows int) (*Result, error) {
 	start := time.Now()
 	if !returnsRows(sqlText) {
-		r, err := c.db.ExecContext(ctx, sqlText)
+		r, err := c.db.ExecContext(ctx, sqlText, params...)
 		if err != nil {
 			return nil, err
 		}
@@ -72,7 +72,7 @@ func (c *SQLiteConn) Query(ctx context.Context, sqlText string, maxRows int) (*R
 		}, nil
 	}
 
-	rows, err := c.db.QueryContext(ctx, sqlText)
+	rows, err := c.db.QueryContext(ctx, sqlText, params...)
 	if err != nil {
 		return nil, err
 	}

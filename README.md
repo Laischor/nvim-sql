@@ -17,8 +17,13 @@ editing instead of a re-implementation.
   introspection: tables after `FROM`/`JOIN`, columns after `alias.` /
   `table.` (aliases resolved from the buffer), tables after `schema.`.
   Cached per connection; `:Sqledit refresh` after DDL.
+- **Editable grid** — `c` on a cell opens an input and writes the change
+  back as a parameterized `UPDATE … WHERE <pk>`. Only for plain
+  single-table SELECTs with the primary key in the result; everything
+  else stays read-only. `NULL` as input means SQL NULL, `r` re-runs the
+  query.
 - **Prod guard** — servers marked `prod = true` get a warning tag and a
-  confirm prompt before any write statement.
+  confirm prompt before any write statement, including cell edits.
 - **Go backend** — `pgx`/`modernc.org/sqlite` over JSON-RPC, no `psql`
   text-scraping.
 
@@ -111,11 +116,12 @@ sources = {
 Suggestions need an active connection (`:Sqledit connect`). Quoted
 identifiers in alias definitions are not resolved yet.
 
+Grid keys: `c` edit cell, `r` re-run query, `q` close.
+
 `:checkhealth sqledit` verifies backend binary and config.
 
 ## Roadmap
 
-- editable grid: change a cell, `:write` emits `UPDATE … WHERE <pk>`
 - FK jump: `gd` on a foreign-key cell opens the referenced row
 - query history per connection
 - tree view as secondary browsing

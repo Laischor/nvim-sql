@@ -83,6 +83,40 @@ local function quote_ident(name)
   return '"' .. name:gsub('"', '""') .. '"'
 end
 
+---Detect a plain single-table SELECT so the grid can offer cell editing.
+---Conservative: any join/group/union/distinct or a second FROM disables it.
+local function detect_source(sql)
+  local s = sql:lower()
+  if not s:match("^%s*select%f[%W]") then
+    return nil
+  end
+  for _, kw in ipairs({ "join", "group", "union", "distinct", "having" }) do
+    if s:match("%f[%w]" .. kw .. "%f[%W]") then
+      return nil
+    end
+  end
+  local from_count = 0
+  for _ in s:gmatch("%f[%w]from%f[%W]") do
+    from_count = from_count + 1
+  end
+  if from_count ~= 1 then
+    return nil
+  end
+  local token = sql:match("[fF][rR][oO][mM]%s+([%w_%.\"]+)")
+  if not token or token:find(",", 1, true) then
+    return nil
+  end
+  token = token:gsub('"', "")
+  local schema, tbl = token:match("^([%w_]+)%.([%w_]+)$")
+  if not schema then
+    tbl = token:match("^[%w_]+$")
+    if not tbl then
+      return nil
+    end
+  end
+  return { schema = schema, table_ = tbl }
+end
+
 ---Run SQL on the current connection and show the result grid.
 function M.run(sql)
   if not ensure_backend() then
@@ -110,7 +144,16 @@ function M.run(sql)
       notify_err(err)
       return
     end
-    grid.render(result, { conn = c.id, prod = c.prod })
+    grid.render(result, {
+      conn = c.id,
+      adapter = c.adapter,
+      prod = c.prod,
+      sql = sql,
+      source = detect_source(sql),
+      rerun = function()
+        M.run(sql)
+      end,
+    })
   end)
 end
 

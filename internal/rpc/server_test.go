@@ -148,6 +148,26 @@ func TestSQLiteEndToEnd(t *testing.T) {
 		t.Fatalf("returning: %v", res["rows"])
 	}
 
+	// parameterized update — text params, NULL as JSON null
+	res = c.call(t, "query", map[string]any{"id": connID,
+		"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{"31", "alice"}})
+	if res["rows_affected"].(float64) != 1 {
+		t.Fatalf("param update: rows_affected = %v", res["rows_affected"])
+	}
+	res = c.call(t, "query", map[string]any{"id": connID,
+		"sql": "SELECT age FROM users WHERE name = ?", "params": []any{"alice"}})
+	if res["rows"].([]any)[0].([]any)[0].(float64) != 31 {
+		t.Fatalf("param update not applied: %v", res["rows"])
+	}
+	res = c.call(t, "query", map[string]any{"id": connID,
+		"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{nil, "alice"}})
+	if res["rows_affected"].(float64) != 1 {
+		t.Fatalf("null param update: %v", res["rows_affected"])
+	}
+	// non-string params rejected
+	c.callErr(t, "query", map[string]any{"id": connID,
+		"sql": "SELECT ?", "params": []any{42}})
+
 	res = c.call(t, "objects", map[string]any{"id": connID})
 	objs := res["objects"].([]any)
 	if len(objs) != 1 {

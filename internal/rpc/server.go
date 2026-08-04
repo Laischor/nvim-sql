@@ -180,6 +180,7 @@ func (s *Server) dispatch(req *request) (any, error) {
 			ID      string `json:"id"`
 			SQL     string `json:"sql"`
 			MaxRows int    `json:"max_rows"`
+			Params  []any  `json:"params"`
 		}
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return nil, err
@@ -187,11 +188,20 @@ func (s *Server) dispatch(req *request) (any, error) {
 		if p.MaxRows <= 0 {
 			p.MaxRows = 500
 		}
+		// only text params: servers cast text to the column type, which
+		// avoids client-side type guessing (and float64 from JSON numbers)
+		for i, v := range p.Params {
+			switch v.(type) {
+			case string, nil:
+			default:
+				return nil, fmt.Errorf("param %d: must be string or null, got %T", i+1, v)
+			}
+		}
 		conn, err := s.conn(p.ID)
 		if err != nil {
 			return nil, err
 		}
-		return conn.Query(ctx, p.SQL, p.MaxRows)
+		return conn.Query(ctx, p.SQL, p.Params, p.MaxRows)
 
 	case "objects":
 		var p struct {

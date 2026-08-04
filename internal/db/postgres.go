@@ -96,9 +96,9 @@ func PGConnect(ctx context.Context, s *config.Server, database string) (*PGConn,
 
 func (c *PGConn) Close() { c.pool.Close() }
 
-func (c *PGConn) Query(ctx context.Context, sqlText string, maxRows int) (*Result, error) {
+func (c *PGConn) Query(ctx context.Context, sqlText string, params []any, maxRows int) (*Result, error) {
 	start := time.Now()
-	rows, err := c.pool.Query(ctx, sqlText)
+	rows, err := c.pool.Query(ctx, sqlText, params...)
 	if err != nil {
 		return nil, err
 	}

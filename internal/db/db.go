@@ -40,7 +40,10 @@ type Result struct {
 
 // Conn is one live connection to a specific database.
 type Conn interface {
-	Query(ctx context.Context, sql string, maxRows int) (*Result, error)
+	// Query runs sql with optional positional params ($1… for postgres,
+	// ? for sqlite). Param values are strings or nil — servers cast text
+	// to the target column type.
+	Query(ctx context.Context, sql string, params []any, maxRows int) (*Result, error)
 	Objects(ctx context.Context) ([]Object, error)
 	Columns(ctx context.Context, schema, table string) ([]Column, error)
 	Close()
