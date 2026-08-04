@@ -46,4 +46,7 @@ maintenance database (postgres) or `main` (sqlite). The returned `id`
 ### `objects {id}` → `{objects: [{schema, name, type}]}`
 Tables, views, matviews. `type` ∈ `table | view | matview | foreign`.
 
-### `columns {id, schema, table}` → `{columns: [{name, type, not_null, pk}]}`
+### `columns {id, schema, table}` → `{columns: [{name, type, not_null, pk, fk?}]}`
+`fk` is present on single-column foreign keys: `{schema, table, column}`.
+sqlite FKs declared without a target column resolve to the target's
+primary key. Composite FKs carry no `fk` (no single cell to jump from).

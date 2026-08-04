@@ -17,11 +17,19 @@ type Object struct {
 	Type   string `json:"type"` // table | view | matview | foreign
 }
 
+// FKRef is the target of a single-column foreign key.
+type FKRef struct {
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+	Column string `json:"column"`
+}
+
 type Column struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
 	NotNull bool   `json:"not_null"`
 	PK      bool   `json:"pk"`
+	FK      *FKRef `json:"fk,omitempty"`
 }
 
 type ColumnMeta struct {

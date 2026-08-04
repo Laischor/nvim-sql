@@ -89,6 +89,9 @@ local function ensure_window()
         state.meta.rerun()
       end
     end, { buffer = state.buf, desc = "sqledit: re-run query" })
+    vim.keymap.set("n", "gd", function()
+      M.fk_jump()
+    end, { buffer = state.buf, nowait = true, desc = "sqledit: follow foreign key" })
   end
   local prev = vim.api.nvim_get_current_win()
   vim.cmd("botright split")
@@ -141,7 +144,7 @@ local function redraw()
     result.row_count or #rows,
     result.more and " (truncated, raise max_rows)" or "",
     result.duration_ms or 0,
-    meta.source and "  •  c:edit r:rerun" or ""
+    meta.source and "  •  c:edit gd:fk r:rerun" or ""
   )
   table.insert(lines, status)
   table.insert(lines, table.concat(header, " │ "))
@@ -333,6 +336,62 @@ local function apply_update(row, col, input)
     redraw()
     vim.api.nvim_win_set_cursor(state.win, cursor)
     vim.notify(("sqledit: updated %s.%s.%s"):format(src.schema, src.table_, col_name))
+  end)
+end
+
+---SQL literal for a cell value in an equality comparison. Values come
+---from the database itself; strings are quoted with '' doubling.
+local function sql_literal(v)
+  if type(v) == "number" then
+    return tostring(v)
+  end
+  return "'" .. tostring(v):gsub("'", "''") .. "'"
+end
+
+---Follow the foreign key of the cell under the cursor: opens the
+---referenced row in the grid (read-only SELECT).
+function M.fk_jump()
+  if not (state.result and state.meta) then
+    return
+  end
+  if not state.meta.source then
+    notify_err("result not editable (needs a plain single-table SELECT)")
+    return
+  end
+  local row, col = cell_at_cursor()
+  if not row then
+    notify_err("no cell under cursor")
+    return
+  end
+  get_table_columns(function(table_cols)
+    local col_name = state.result.columns[col].name
+    local fk
+    for _, c in ipairs(table_cols) do
+      if c.name == col_name then
+        fk = c.fk
+        break
+      end
+    end
+    if not fk or fk == vim.NIL then
+      notify_err(("no foreign key on %q"):format(col_name))
+      return
+    end
+    local value = state.result.rows[row][col]
+    if value == nil or value == vim.NIL then
+      notify_err(col_name .. " is NULL — nothing to follow")
+      return
+    end
+    if type(value) == "table" then
+      notify_err("cannot follow a structured value")
+      return
+    end
+    local sql = ("SELECT * FROM %s.%s WHERE %s = %s"):format(
+      quote_ident(fk.schema),
+      quote_ident(fk.table),
+      quote_ident(fk.column),
+      sql_literal(value)
+    )
+    require("sqledit").run(sql)
   end)
 end
 

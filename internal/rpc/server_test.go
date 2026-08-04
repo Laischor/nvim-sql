@@ -192,6 +192,31 @@ func TestSQLiteEndToEnd(t *testing.T) {
 		t.Fatalf("columns[1]: %v", col1)
 	}
 
+	// foreign key metadata (explicit target column and implicit-pk reference)
+	c.call(t, "query", map[string]any{"id": connID,
+		"sql": "CREATE TABLE owners (id integer primary key, name text)"})
+	c.call(t, "query", map[string]any{"id": connID,
+		"sql": `CREATE TABLE dogs (id integer primary key,
+		        owner_id int REFERENCES owners(id),
+		        sitter_id int REFERENCES owners)`})
+	res = c.call(t, "columns", map[string]any{"id": connID, "schema": "main", "table": "dogs"})
+	fkByName := map[string]map[string]any{}
+	for _, raw := range res["columns"].([]any) {
+		col := raw.(map[string]any)
+		if fk, ok := col["fk"].(map[string]any); ok {
+			fkByName[col["name"].(string)] = fk
+		}
+	}
+	for _, name := range []string{"owner_id", "sitter_id"} {
+		fk := fkByName[name]
+		if fk == nil || fk["table"] != "owners" || fk["column"] != "id" || fk["schema"] != "main" {
+			t.Fatalf("fk on %s: %v", name, fk)
+		}
+	}
+	if len(fkByName) != 2 {
+		t.Fatalf("unexpected fks: %v", fkByName)
+	}
+
 	// bad SQL surfaces as rpc error, not a dead server
 	c.callErr(t, "query", map[string]any{"id": connID, "sql": "SELEC nope"})
 	// unknown connection

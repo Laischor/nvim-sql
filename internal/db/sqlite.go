@@ -162,5 +162,83 @@ func (c *SQLiteConn) Columns(ctx context.Context, schema, table string) ([]Colum
 		col.PK = pk != 0
 		cols = append(cols, col)
 	}
-	return cols, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	fks, err := c.foreignKeys(ctx, table)
+	if err != nil {
+		return nil, err
+	}
+	for i := range cols {
+		if fk, ok := fks[cols[i].Name]; ok {
+			cols[i].FK = fk
+		}
+	}
+	return cols, nil
+}
+
+// foreignKeys returns single-column FKs as from-column -> target.
+func (c *SQLiteConn) foreignKeys(ctx context.Context, table string) (map[string]*FKRef, error) {
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT id, "table", "from", "to" FROM pragma_foreign_key_list(?) ORDER BY id, seq`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type entry struct {
+		count int
+		from  string
+		ref   FKRef
+	}
+	byID := map[int]*entry{}
+	var order []int
+	for rows.Next() {
+		var id int
+		var target, from string
+		var to sql.NullString
+		if err := rows.Scan(&id, &target, &from, &to); err != nil {
+			return nil, err
+		}
+		e := byID[id]
+		if e == nil {
+			e = &entry{}
+			byID[id] = e
+			order = append(order, id)
+		}
+		e.count++
+		e.from = from
+		e.ref = FKRef{Schema: "main", Table: target, Column: to.String}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	fks := map[string]*FKRef{}
+	for _, id := range order {
+		e := byID[id]
+		if e.count != 1 { // composite FK — no single cell to jump from
+			continue
+		}
+		if e.ref.Column == "" {
+			// implicit reference to the target's primary key
+			pk, err := c.primaryKeyColumn(ctx, e.ref.Table)
+			if err != nil || pk == "" {
+				continue
+			}
+			e.ref.Column = pk
+		}
+		ref := e.ref
+		fks[e.from] = &ref
+	}
+	return fks, nil
+}
+
+func (c *SQLiteConn) primaryKeyColumn(ctx context.Context, table string) (string, error) {
+	var name string
+	err := c.db.QueryRowContext(ctx,
+		`SELECT name FROM pragma_table_info(?) WHERE pk = 1`, table).Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return name, err
 }

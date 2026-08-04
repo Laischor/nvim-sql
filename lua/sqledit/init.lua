@@ -144,6 +144,7 @@ function M.run(sql)
       notify_err(err)
       return
     end
+    require("sqledit.history").add(c.id, sql)
     grid.render(result, {
       conn = c.id,
       adapter = c.adapter,
@@ -292,8 +293,9 @@ function M.tables()
   end)
 end
 
----Open a scratch SQL buffer bound to the current connection.
-function M.query()
+---Open a scratch SQL buffer bound to the current connection,
+---optionally prefilled.
+function M.query(initial)
   state.query_count = state.query_count + 1
   local buf = vim.api.nvim_create_buf(true, true)
   vim.api.nvim_buf_set_name(buf, ("sqledit://query-%d"):format(state.query_count))
@@ -301,10 +303,42 @@ function M.query()
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
+  if initial then
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(initial, "\n", { plain = true }))
+  end
   vim.api.nvim_set_current_buf(buf)
   vim.keymap.set({ "n", "x" }, M.config.run_key, function()
     M.run_buffer()
   end, { buffer = buf, desc = "sqledit: run query" })
+end
+
+---Pick a query from this connection's history; opens it in a query
+---buffer (never runs it directly).
+function M.history()
+  local c = state.current
+  if not c then
+    notify_err("no connection — :Sqledit connect first")
+    return
+  end
+  local entries = require("sqledit.history").get(c.id)
+  if #entries == 0 then
+    vim.notify("sqledit: no history for " .. c.id)
+    return
+  end
+  vim.ui.select(entries, {
+    prompt = "Query history for " .. c.id,
+    format_item = function(e)
+      local flat = e.sql:gsub("%s+", " ")
+      if vim.fn.strchars(flat) > 80 then
+        flat = vim.fn.strcharpart(flat, 0, 77) .. "..."
+      end
+      return os.date("%Y-%m-%d %H:%M", e.ts) .. "  " .. flat
+    end,
+  }, function(entry)
+    if entry then
+      M.query(entry.sql)
+    end
+  end)
 end
 
 ---Run the visual selection if in visual mode, else the whole buffer.

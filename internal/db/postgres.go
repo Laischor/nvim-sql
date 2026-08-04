@@ -179,5 +179,39 @@ func (c *PGConn) Columns(ctx context.Context, schema, table string) ([]Column, e
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[Column])
+	cols, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Column])
+	if err != nil {
+		return nil, err
+	}
+
+	// single-column foreign keys (composite FKs have no obvious cell to jump from)
+	fkRows, err := c.pool.Query(ctx, `
+		SELECT a.attname, fn.nspname, fc.relname, fa.attname
+		FROM pg_constraint ct
+		JOIN pg_class c ON c.oid = ct.conrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_class fc ON fc.oid = ct.confrelid
+		JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+		JOIN pg_attribute a ON a.attrelid = ct.conrelid AND a.attnum = ct.conkey[1]
+		JOIN pg_attribute fa ON fa.attrelid = ct.confrelid AND fa.attnum = ct.confkey[1]
+		WHERE ct.contype = 'f' AND cardinality(ct.conkey) = 1
+		  AND n.nspname = $1 AND c.relname = $2`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	type fkRow struct {
+		Col, Schema, Table, Column string
+	}
+	fks, err := pgx.CollectRows(fkRows, pgx.RowToStructByPos[fkRow])
+	if err != nil {
+		return nil, err
+	}
+	for _, fk := range fks {
+		for i := range cols {
+			if cols[i].Name == fk.Col {
+				cols[i].FK = &FKRef{Schema: fk.Schema, Table: fk.Table, Column: fk.Column}
+			}
+		}
+	}
+	return cols, nil
 }

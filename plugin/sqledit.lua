@@ -3,7 +3,7 @@ if vim.g.loaded_sqledit then
 end
 vim.g.loaded_sqledit = true
 
-local subcommands = { "connect", "switch", "tables", "query", "run", "refresh", "disconnect" }
+local subcommands = { "connect", "switch", "tables", "query", "run", "history", "refresh", "disconnect" }
 
 vim.api.nvim_create_user_command("Sqledit", function(cmd)
   local sqledit = require("sqledit")
@@ -24,6 +24,8 @@ vim.api.nvim_create_user_command("Sqledit", function(cmd)
     else
       sqledit.run_buffer()
     end
+  elseif sub == "history" then
+    sqledit.history()
   elseif sub == "refresh" then
     sqledit.refresh()
   elseif sub == "disconnect" then

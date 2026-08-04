@@ -22,6 +22,11 @@ editing instead of a re-implementation.
   single-table SELECTs with the primary key in the result; everything
   else stays read-only. `NULL` as input means SQL NULL, `r` re-runs the
   query.
+- **FK jump** — `gd` on a foreign-key cell opens the referenced row.
+  Works recursively: the target grid is a normal grid.
+- **Query history** — `:Sqledit history` fuzzy-picks from this
+  connection's past queries (persisted across sessions) and opens the
+  pick in a query buffer — it never executes directly.
 - **Prod guard** — servers marked `prod = true` get a warning tag and a
   confirm prompt before any write statement, including cell edits.
 - **Go backend** — `pgx`/`modernc.org/sqlite` over JSON-RPC, no `psql`
@@ -96,6 +101,7 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 | `:Sqledit tables` | fuzzy-pick a table/view → `SELECT * … LIMIT n` |
 | `:Sqledit query` | open a scratch SQL buffer (run: `<localleader>r`) |
 | `:Sqledit run [sql]` | run argument, visual range, or current buffer |
+| `:Sqledit history` | pick a past query → opens in a query buffer |
 | `:Sqledit refresh` | clear schema cache (completion re-introspects) |
 | `:Sqledit disconnect` | drop current connection |
 
@@ -116,15 +122,14 @@ sources = {
 Suggestions need an active connection (`:Sqledit connect`). Quoted
 identifiers in alias definitions are not resolved yet.
 
-Grid keys: `c` edit cell, `r` re-run query, `q` close.
+Grid keys: `c` edit cell, `gd` follow foreign key, `r` re-run query, `q` close.
 
 `:checkhealth sqledit` verifies backend binary and config.
 
 ## Roadmap
 
-- FK jump: `gd` on a foreign-key cell opens the referenced row
-- query history per connection
 - tree view as secondary browsing
+- multi-statement support for postgres (single statement per run for now)
 
 ## Development
 
