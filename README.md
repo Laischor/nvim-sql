@@ -8,7 +8,8 @@ editing instead of a re-implementation.
   `vim.ui.select` (renders in telescope/fzf-lua/snacks if you use them).
   No tree drilling.
 - **Cheap connection switching** — `:Sqledit switch` changes connection and
-  re-runs your last query there. Databases are listed live from the server,
+  offers to re-run your last query there (confirm with preview; write
+  statements are never offered). Databases are listed live from the server,
   so ad-hoc copies appear without config changes.
 - **Real vim** — queries live in normal `sql` buffers: your keymaps, your
   LSP, your treesitter.
@@ -82,7 +83,7 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 | Command | |
 |---|---|
 | `:Sqledit connect` | pick server → database → connect |
-| `:Sqledit switch` | reconnect elsewhere, re-run last query there |
+| `:Sqledit switch` | reconnect elsewhere, offer re-run of last query (confirmed, reads only) |
 | `:Sqledit tables` | fuzzy-pick a table/view → `SELECT * … LIMIT n` |
 | `:Sqledit query` | open a scratch SQL buffer (run: `<localleader>r`) |
 | `:Sqledit run [sql]` | run argument, visual range, or current buffer |

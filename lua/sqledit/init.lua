@@ -174,12 +174,28 @@ function M.connect(on_done)
   end)
 end
 
----Switch connection and re-run the last query against it — same table,
----different site/env.
+---Switch connection, then offer to re-run the last query there — same
+---table, different site/env. Never runs anything silently: read-only
+---queries need a confirm (with preview), writes are never offered.
 function M.switch()
   local sql = state.last_sql
-  M.connect(function()
-    if sql then
+  M.connect(function(info)
+    if not sql then
+      return
+    end
+    if is_write(sql) then
+      vim.notify(
+        "sqledit: last query contains write statements — not offering a re-run on " .. info.id,
+        vim.log.levels.WARN
+      )
+      return
+    end
+    local preview = vim.trim(sql:gsub("%s+", " "))
+    if vim.fn.strchars(preview) > 80 then
+      preview = vim.fn.strcharpart(preview, 0, 77) .. "..."
+    end
+    local prompt = ("Re-run last query on %s%s?\n\n  %s"):format(info.id, info.prod and " [PROD]" or "", preview)
+    if vim.fn.confirm(prompt, "&Yes\n&No", 2) == 1 then
       M.run(sql)
     end
   end)
