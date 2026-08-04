@@ -13,6 +13,10 @@ editing instead of a re-implementation.
   so ad-hoc copies appear without config changes.
 - **Real vim** — queries live in normal `sql` buffers: your keymaps, your
   LSP, your treesitter.
+- **Schema-aware completion** — blink.cmp source fed from live
+  introspection: tables after `FROM`/`JOIN`, columns after `alias.` /
+  `table.` (aliases resolved from the buffer), tables after `schema.`.
+  Cached per connection; `:Sqledit refresh` after DDL.
 - **Prod guard** — servers marked `prod = true` get a warning tag and a
   confirm prompt before any write statement.
 - **Go backend** — `pgx`/`modernc.org/sqlite` over JSON-RPC, no `psql`
@@ -87,15 +91,30 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 | `:Sqledit tables` | fuzzy-pick a table/view → `SELECT * … LIMIT n` |
 | `:Sqledit query` | open a scratch SQL buffer (run: `<localleader>r`) |
 | `:Sqledit run [sql]` | run argument, visual range, or current buffer |
+| `:Sqledit refresh` | clear schema cache (completion re-introspects) |
 | `:Sqledit disconnect` | drop current connection |
 
 Statusline: `require("sqledit").status()` → `"site3-prod/app [PROD]"`.
+
+### Completion (blink.cmp)
+
+```lua
+-- in your blink.cmp opts
+sources = {
+  per_filetype = { sql = { "sqledit", "buffer" } },
+  providers = {
+    sqledit = { name = "sqledit", module = "sqledit.blink" },
+  },
+}
+```
+
+Suggestions need an active connection (`:Sqledit connect`). Quoted
+identifiers in alias definitions are not resolved yet.
 
 `:checkhealth sqledit` verifies backend binary and config.
 
 ## Roadmap
 
-- completion source (blink.cmp) fed from schema introspection
 - editable grid: change a cell, `:write` emits `UPDATE … WHERE <pk>`
 - FK jump: `gd` on a foreign-key cell opens the referenced row
 - query history per connection

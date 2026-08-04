@@ -52,6 +52,18 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
 
+---Current connection info ({id, server, database, adapter, prod, readonly})
+---or nil. Used by completion sources.
+function M.current()
+  return state.current
+end
+
+---Drop cached schema data so completion re-introspects (e.g. after DDL).
+function M.refresh()
+  require("sqledit.completion").refresh()
+  vim.notify("sqledit: schema cache cleared")
+end
+
 ---Current connection label for the statusline, e.g. "site3/analytics [PROD]".
 function M.status()
   local c = state.current
