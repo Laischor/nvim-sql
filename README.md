@@ -99,6 +99,7 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 | `:Sqledit connect` | pick server → database → connect |
 | `:Sqledit switch` | reconnect elsewhere, offer re-run of last query (confirmed, reads only) |
 | `:Sqledit tables` | fuzzy-pick a table/view → `SELECT * … LIMIT n` |
+| `:Sqledit filter` | like `tables`, plus prompts for `WHERE` / `ORDER BY` |
 | `:Sqledit query` | open a scratch SQL buffer (run: `<localleader>r`) |
 | `:Sqledit run [sql]` | run argument, visual range, or current buffer |
 | `:Sqledit history` | pick a past query → opens in a query buffer |

@@ -287,8 +287,32 @@ function M.switch()
   end)
 end
 
+---Ask for optional WHERE / ORDER BY clauses, then hand back the suffix.
+local function input_clauses(cb)
+  vim.ui.input({ prompt = "WHERE (empty: none): " }, function(where)
+    if where == nil then -- cancelled
+      return
+    end
+    vim.ui.input({ prompt = "ORDER BY (empty: none): " }, function(order)
+      if order == nil then
+        return
+      end
+      local suffix = ""
+      if vim.trim(where) ~= "" then
+        suffix = suffix .. " WHERE " .. vim.trim(where)
+      end
+      if vim.trim(order) ~= "" then
+        suffix = suffix .. " ORDER BY " .. vim.trim(order)
+      end
+      cb(suffix)
+    end)
+  end)
+end
+
 ---Fuzzy-pick a table/view across all schemas, then SELECT it.
-function M.tables()
+---opts.clauses: also prompt for WHERE / ORDER BY.
+function M.tables(opts)
+  opts = opts or {}
   if not ensure_backend() then
     return
   end
@@ -296,7 +320,7 @@ function M.tables()
   if not c then
     -- no connection yet: connect first, then re-open the picker
     M.connect(function()
-      M.tables()
+      M.tables(opts)
     end)
     return
   end
@@ -316,11 +340,24 @@ function M.tables()
         return ("%s.%s  [%s]"):format(o.schema, o.name, o.type)
       end,
     }, function(obj)
-      if obj then
-        M.run(("SELECT * FROM %s.%s LIMIT %d"):format(quote_ident(obj.schema), quote_ident(obj.name), M.config.max_rows))
+      if not obj then
+        return
       end
+      local base = ("SELECT * FROM %s.%s"):format(quote_ident(obj.schema), quote_ident(obj.name))
+      if not opts.clauses then
+        M.run(("%s LIMIT %d"):format(base, M.config.max_rows))
+        return
+      end
+      input_clauses(function(suffix)
+        M.run(("%s%s LIMIT %d"):format(base, suffix, M.config.max_rows))
+      end)
     end)
   end)
+end
+
+---Like tables(), but asks for WHERE / ORDER BY before running.
+function M.filter()
+  M.tables({ clauses = true })
 end
 
 ---Open a scratch SQL buffer bound to the current connection,

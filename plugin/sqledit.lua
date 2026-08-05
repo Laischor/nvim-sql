@@ -3,7 +3,7 @@ if vim.g.loaded_sqledit then
 end
 vim.g.loaded_sqledit = true
 
-local subcommands = { "connect", "switch", "tables", "query", "run", "history", "refresh", "disconnect" }
+local subcommands = { "connect", "switch", "tables", "filter", "query", "run", "history", "refresh", "disconnect" }
 
 vim.api.nvim_create_user_command("Sqledit", function(cmd)
   local sqledit = require("sqledit")
@@ -14,6 +14,8 @@ vim.api.nvim_create_user_command("Sqledit", function(cmd)
     sqledit.switch()
   elseif sub == "tables" then
     sqledit.tables()
+  elseif sub == "filter" then
+    sqledit.filter()
   elseif sub == "query" then
     sqledit.query()
   elseif sub == "run" then
