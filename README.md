@@ -56,32 +56,40 @@ Requires Go 1.26+ to build the backend.
 `~/.config/sqledit/connections.toml` (or `$SQLEDIT_CONFIG`):
 
 ```toml
-[[servers]]
-name = "local"
-adapter = "postgres"          # host/port default to localhost:5432
-user = "mr"
+# applied to every server where the field is not set explicitly
+# (prod/readonly are intentionally not defaultable)
+[defaults]
+adapter = "postgres"
+user = "support"
+password_keychain = "sqledit/support"   # macOS keychain service name
 
 [[servers]]
-name = "site3-prod"
-adapter = "postgres"
-host = "site3.example.com"
-user = "support"
-password_keychain = "sqledit/site3"   # macOS keychain service name
-prod = true                            # confirm before writes
-# readonly = true                      # default_transaction_read_only
-
-[[servers]]
-name = "site3-staging"
-adapter = "postgres"
-host = "staging.site3.example.com"
-user = "support"
-password_env = "SITE3_STAGING_PW"
+name = "local"                # host/port default to localhost:5432
 
 [[servers]]
 name = "analytics"
 adapter = "sqlite"
 path = "~/data/analytics.db"
+
+# many similar deployments: templates expanded once per name,
+# "{name}" replaced in every string field
+[[groups]]
+names = ["site1", "site2", "site3"]
+
+[[groups.servers]]
+name = "{name}-prod"
+host = "{name}.example.com"
+prod = true                   # tag + confirm before writes
+# readonly = true             # default_transaction_read_only
+
+[[groups.servers]]
+name = "{name}-staging"
+host = "staging.{name}.example.com"
+password_env = "STAGING_PW"   # overrides the keychain default
 ```
+
+This yields `local`, `analytics`, `site1-prod`, `site1-staging`, … —
+a new deployment is one entry in `names`.
 
 Store keychain passwords once:
 

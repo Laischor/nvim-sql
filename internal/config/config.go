@@ -39,8 +39,20 @@ type Server struct {
 	ReadOnly bool `toml:"readonly" json:"readonly"`
 }
 
-type Config struct {
+// Group expands template servers once per name: every "{name}" in a
+// string field is replaced. names = ["a", "b"] with two templates
+// yields four servers.
+type Group struct {
+	Names   []string `toml:"names"`
 	Servers []Server `toml:"servers"`
+}
+
+type Config struct {
+	// Defaults fills empty fields of every server (plain and generated).
+	// prod/readonly are not defaultable — too dangerous to inherit.
+	Defaults *Server  `toml:"defaults"`
+	Servers  []Server `toml:"servers"`
+	Groups   []Group  `toml:"groups"`
 
 	// FilePath is where the config was loaded from (informational).
 	FilePath string `toml:"-"`
@@ -75,6 +87,25 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	cfg.FilePath = path
+
+	for gi, g := range cfg.Groups {
+		if len(g.Names) == 0 {
+			return nil, fmt.Errorf("%s: group #%d has no names", path, gi+1)
+		}
+		if len(g.Servers) == 0 {
+			return nil, fmt.Errorf("%s: group #%d has no [[groups.servers]] templates", path, gi+1)
+		}
+		for _, name := range g.Names {
+			for _, tpl := range g.Servers {
+				cfg.Servers = append(cfg.Servers, substituted(tpl, name))
+			}
+		}
+	}
+	if cfg.Defaults != nil {
+		for i := range cfg.Servers {
+			applyDefaults(&cfg.Servers[i], cfg.Defaults)
+		}
+	}
 
 	seen := map[string]bool{}
 	for i := range cfg.Servers {
@@ -139,6 +170,61 @@ func (s *Server) ResolvePassword() (string, error) {
 		return keychain.Get(s.PasswordKeychain, account)
 	}
 	return "", nil // no password configured — may be fine (trust auth, .pgpass, …)
+}
+
+// substituted returns the template with "{name}" replaced in every
+// string field (params values included).
+func substituted(tpl Server, name string) Server {
+	sub := func(s string) string {
+		return strings.ReplaceAll(s, "{name}", name)
+	}
+	s := tpl
+	s.Name = sub(s.Name)
+	s.Host = sub(s.Host)
+	s.User = sub(s.User)
+	s.Database = sub(s.Database)
+	s.SSLMode = sub(s.SSLMode)
+	s.Path = sub(s.Path)
+	s.PasswordEnv = sub(s.PasswordEnv)
+	s.PasswordKeychain = sub(s.PasswordKeychain)
+	s.KeychainAccount = sub(s.KeychainAccount)
+	if tpl.Params != nil {
+		s.Params = make(map[string]string, len(tpl.Params))
+		for k, v := range tpl.Params {
+			s.Params[k] = sub(v)
+		}
+	}
+	return s
+}
+
+// applyDefaults fills empty fields from d. prod/readonly stay per-server.
+func applyDefaults(s, d *Server) {
+	fill := func(dst *string, def string) {
+		if *dst == "" {
+			*dst = def
+		}
+	}
+	fill(&s.Adapter, d.Adapter)
+	fill(&s.Host, d.Host)
+	fill(&s.User, d.User)
+	fill(&s.Database, d.Database)
+	fill(&s.SSLMode, d.SSLMode)
+	fill(&s.Path, d.Path)
+	fill(&s.Password, d.Password)
+	fill(&s.PasswordEnv, d.PasswordEnv)
+	fill(&s.PasswordKeychain, d.PasswordKeychain)
+	fill(&s.KeychainAccount, d.KeychainAccount)
+	if s.Port == 0 {
+		s.Port = d.Port
+	}
+	for k, v := range d.Params {
+		if s.Params == nil {
+			s.Params = map[string]string{}
+		}
+		if _, ok := s.Params[k]; !ok {
+			s.Params[k] = v
+		}
+	}
 }
 
 func expandHome(p string) string {

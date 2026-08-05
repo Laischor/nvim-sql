@@ -59,6 +59,82 @@ path = "~/data/analytics.db"
 	}
 }
 
+func TestDefaultsAndGroups(t *testing.T) {
+	cfg, err := Load(write(t, `
+[defaults]
+adapter = "postgres"
+user = "infosys"
+password_keychain = "sqledit/infosys"
+
+[[servers]]
+name = "local"
+port = 102
+
+[[groups]]
+names = ["purina", "bonzo"]
+
+[[groups.servers]]
+name = "{name}-prod"
+host = "{name}.tst-tool.com"
+prod = true
+
+[[groups.servers]]
+name = "{name}-staging"
+host = "t-{name}.tst-tool.com"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Servers) != 5 { // local + 2 names x 2 templates
+		t.Fatalf("got %d servers: %+v", len(cfg.Servers), cfg.Servers)
+	}
+
+	local, err := cfg.Find("local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.User != "infosys" || local.PasswordKeychain != "sqledit/infosys" ||
+		local.Port != 102 || local.Host != "localhost" || local.Adapter != "postgres" {
+		t.Fatalf("defaults not applied to plain server: %+v", local)
+	}
+
+	prod, err := cfg.Find("purina-prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prod.Host != "purina.tst-tool.com" || !prod.Prod || prod.User != "infosys" ||
+		prod.Port != 5432 || prod.PasswordKeychain != "sqledit/infosys" {
+		t.Fatalf("purina-prod: %+v", prod)
+	}
+
+	staging, err := cfg.Find("bonzo-staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staging.Host != "t-bonzo.tst-tool.com" || staging.Prod {
+		t.Fatalf("bonzo-staging: %+v", staging)
+	}
+}
+
+func TestGroupValidation(t *testing.T) {
+	if _, err := Load(write(t, "[[groups]]\n[[groups.servers]]\nname = \"x\"\nadapter = \"postgres\"\n")); err == nil {
+		t.Fatal("group without names should fail")
+	}
+	if _, err := Load(write(t, "[[groups]]\nnames = [\"a\"]\n")); err == nil {
+		t.Fatal("group without templates should fail")
+	}
+	// template without {name} in the name collides across names
+	if _, err := Load(write(t, `
+[[groups]]
+names = ["a", "b"]
+[[groups.servers]]
+name = "static"
+adapter = "postgres"
+`)); err == nil {
+		t.Fatal("colliding generated names should fail")
+	}
+}
+
 func TestLoadMissingFileIsEmpty(t *testing.T) {
 	cfg, err := Load(filepath.Join(t.TempDir(), "nope.toml"))
 	if err != nil {
