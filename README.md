@@ -100,6 +100,7 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 | `:Sqledit switch` | reconnect elsewhere, offer re-run of last query (confirmed, reads only) |
 | `:Sqledit tables` | fuzzy-pick a table/view → `SELECT * … LIMIT n` |
 | `:Sqledit filter` | like `tables`, plus prompts for `WHERE` / `ORDER BY` |
+| `:Sqledit refilter` | re-edit the last filter's clauses (prefilled), re-run |
 | `:Sqledit query` | open a scratch SQL buffer (run: `<localleader>r`) |
 | `:Sqledit run [sql]` | run argument, visual range, or current buffer |
 | `:Sqledit history` | pick a past query → opens in a query buffer |
@@ -130,7 +131,8 @@ Suggestions need an active connection (`:Sqledit connect`);
 identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell, `gd` follow foreign key, `w`/`b` next/previous
-column, `gc` jump to column by name, `r` re-run query, `q` close. Column
+column, `gc` jump to column by name, `F` edit the last filter's
+`WHERE`/`ORDER BY`, `r` re-run query, `q` close. Column
 names stay sticky in a header line above the grid — it follows
 horizontal scrolling and survives vertical scrolling. The winbar shows
 the current column (`col 4/23: created_at (timestamptz)`) plus the

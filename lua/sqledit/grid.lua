@@ -112,6 +112,9 @@ local function ensure_buffers()
   vim.keymap.set("n", "gc", function()
     M.pick_column()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: jump to column" })
+  vim.keymap.set("n", "F", function()
+    require("sqledit").refilter()
+  end, { buffer = state.buf, desc = "sqledit: edit filter clauses" })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
     buffer = state.buf,

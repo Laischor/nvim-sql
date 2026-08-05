@@ -287,24 +287,26 @@ function M.switch()
   end)
 end
 
----Ask for optional WHERE / ORDER BY clauses, then hand back the suffix.
-local function input_clauses(cb)
-  vim.ui.input({ prompt = "WHERE (empty: none): " }, function(where)
+---Ask for optional WHERE / ORDER BY clauses (prefilled from `defaults`),
+---then hand back suffix + the raw clauses.
+local function input_clauses(defaults, cb)
+  vim.ui.input({ prompt = "WHERE (empty: none): ", default = defaults.where }, function(where)
     if where == nil then -- cancelled
       return
     end
-    vim.ui.input({ prompt = "ORDER BY (empty: none): " }, function(order)
+    vim.ui.input({ prompt = "ORDER BY (empty: none): ", default = defaults.order }, function(order)
       if order == nil then
         return
       end
+      where, order = vim.trim(where), vim.trim(order)
       local suffix = ""
-      if vim.trim(where) ~= "" then
-        suffix = suffix .. " WHERE " .. vim.trim(where)
+      if where ~= "" then
+        suffix = suffix .. " WHERE " .. where
       end
-      if vim.trim(order) ~= "" then
-        suffix = suffix .. " ORDER BY " .. vim.trim(order)
+      if order ~= "" then
+        suffix = suffix .. " ORDER BY " .. order
       end
-      cb(suffix)
+      cb(suffix, where, order)
     end)
   end)
 end
@@ -348,7 +350,8 @@ function M.tables(opts)
         M.run(("%s LIMIT %d"):format(base, M.config.max_rows))
         return
       end
-      input_clauses(function(suffix)
+      input_clauses({}, function(suffix, where, order)
+        state.last_filter = { base = base, where = where, order = order }
         M.run(("%s%s LIMIT %d"):format(base, suffix, M.config.max_rows))
       end)
     end)
@@ -358,6 +361,20 @@ end
 ---Like tables(), but asks for WHERE / ORDER BY before running.
 function M.filter()
   M.tables({ clauses = true })
+end
+
+---Re-edit the clauses of the last :Sqledit filter (prefilled) and re-run
+---on the same table.
+function M.refilter()
+  local f = state.last_filter
+  if not f then
+    notify_err("no previous filter — :Sqledit filter first")
+    return
+  end
+  input_clauses({ where = f.where, order = f.order }, function(suffix, where, order)
+    state.last_filter = { base = f.base, where = where, order = order }
+    M.run(("%s%s LIMIT %d"):format(f.base, suffix, M.config.max_rows))
+  end)
 end
 
 ---Open a scratch SQL buffer bound to the current connection,
