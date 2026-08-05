@@ -48,8 +48,38 @@ local function ensure_backend()
   return true
 end
 
+local blink_registered = false
+
+---Register the completion source with blink.cmp, if installed. No-op when
+---the user already configured a "sqledit" provider manually.
+local function register_blink()
+  if blink_registered then
+    return
+  end
+  local ok, blink = pcall(require, "blink.cmp")
+  if not ok or type(blink.add_source_provider) ~= "function" then
+    return
+  end
+  blink_registered = true
+  if pcall(blink.add_source_provider, "sqledit", { name = "sqledit", module = "sqledit.blink" }) then
+    blink.add_filetype_source("sql", "sqledit")
+  end
+end
+
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  -- after startup so blink's own setup has run; FileType covers lazy loading
+  vim.schedule(register_blink)
+  vim.api.nvim_create_autocmd("FileType", {
+    pattern = "sql",
+    group = vim.api.nvim_create_augroup("sqledit_blink", { clear = true }),
+    callback = register_blink,
+  })
+end
+
+---For :checkhealth.
+function M.blink_registered()
+  return blink_registered
 end
 
 ---Current connection info ({id, server, database, adapter, prod, readonly})

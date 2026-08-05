@@ -109,6 +109,11 @@ Statusline: `require("sqledit").status()` → `"site3-prod/app [PROD]"`.
 
 ### Completion (blink.cmp)
 
+Registers itself with blink.cmp automatically for `sql` buffers —
+no blink config needed. To manage it manually instead (custom source
+order etc.), define the provider yourself and the auto-registration
+backs off:
+
 ```lua
 -- in your blink.cmp opts
 sources = {
@@ -119,7 +124,8 @@ sources = {
 }
 ```
 
-Suggestions need an active connection (`:Sqledit connect`). Quoted
+Suggestions need an active connection (`:Sqledit connect`);
+`:checkhealth sqledit` shows the registration status. Quoted
 identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell, `gd` follow foreign key, `w`/`b` next/previous

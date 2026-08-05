@@ -18,6 +18,18 @@ function M.check()
     health.error("backend not found: " .. backend, "run `make build` in the plugin directory")
   end
 
+  local has_blink = pcall(require, "blink.cmp")
+  if not has_blink then
+    health.info("blink.cmp not installed — completion source inactive")
+  elseif sqledit.blink_registered() then
+    health.ok("completion source registered with blink.cmp")
+  else
+    health.warn(
+      "blink.cmp found but source not registered yet",
+      "open a sql buffer once, or check for a conflicting manual provider config"
+    )
+  end
+
   local cfg = sqledit.config.connections_file
     or vim.env.SQLEDIT_CONFIG
     or vim.fs.normalize((vim.env.XDG_CONFIG_HOME or "~/.config") .. "/sqledit/connections.toml")
