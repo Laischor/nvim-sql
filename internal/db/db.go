@@ -29,7 +29,8 @@ type Column struct {
 	Type    string `json:"type"`
 	NotNull bool   `json:"not_null"`
 	PK      bool   `json:"pk"`
-	FK      *FKRef `json:"fk,omitempty"`
+	// db:"-" — filled by a second query, not by the row scan
+	FK *FKRef `json:"fk,omitempty" db:"-"`
 }
 
 type ColumnMeta struct {

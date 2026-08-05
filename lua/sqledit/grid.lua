@@ -92,6 +92,23 @@ local function ensure_window()
     vim.keymap.set("n", "gd", function()
       M.fk_jump()
     end, { buffer = state.buf, nowait = true, desc = "sqledit: follow foreign key" })
+    vim.keymap.set("n", "w", function()
+      M.next_column()
+    end, { buffer = state.buf, desc = "sqledit: next column" })
+    vim.keymap.set("n", "b", function()
+      M.prev_column()
+    end, { buffer = state.buf, desc = "sqledit: previous column" })
+    vim.keymap.set("n", "gc", function()
+      M.pick_column()
+    end, { buffer = state.buf, nowait = true, desc = "sqledit: jump to column" })
+    local group = vim.api.nvim_create_augroup("sqledit_grid", { clear = true })
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      group = group,
+      buffer = state.buf,
+      callback = function()
+        M.update_winbar()
+      end,
+    })
   end
   local prev = vim.api.nvim_get_current_win()
   vim.cmd("botright split")
@@ -177,6 +194,7 @@ local function redraw()
 
   local height = math.min(#lines + 1, math.max(10, math.floor(vim.o.lines * 0.4)))
   vim.api.nvim_win_set_height(state.win, height)
+  M.update_winbar()
 end
 
 ---@param result table backend query result
@@ -189,6 +207,85 @@ function M.render(result, meta)
   if #(result.rows or {}) > 0 then
     vim.api.nvim_win_set_cursor(state.win, { HEADER_LINES + 1, 0 })
   end
+end
+
+---Column index for a 1-based byte position, from the (shared) column
+---alignment of the first data row. nil without rows.
+local function column_at(byte_col)
+  local ranges = state.ranges and state.ranges[1]
+  if not ranges then
+    return nil
+  end
+  for i, range in ipairs(ranges) do
+    if byte_col <= range[2] or i == #ranges then
+      return i
+    end
+  end
+end
+
+local function goto_column(i)
+  local ranges = state.ranges and state.ranges[1]
+  if not ranges or not ranges[i] then
+    return
+  end
+  local pos = vim.api.nvim_win_get_cursor(state.win)
+  vim.api.nvim_win_set_cursor(state.win, { pos[1], ranges[i][1] - 1 })
+  M.update_winbar()
+end
+
+---Current column index under the cursor (also for the header lines).
+function M.current_column()
+  if not (state.win and vim.api.nvim_win_is_valid(state.win)) then
+    return nil
+  end
+  return column_at(vim.api.nvim_win_get_cursor(state.win)[2] + 1)
+end
+
+function M.next_column()
+  local i = M.current_column()
+  if i then
+    goto_column(math.min(i + 1, #state.result.columns))
+  end
+end
+
+function M.prev_column()
+  local i = M.current_column()
+  if i then
+    goto_column(math.max(i - 1, 1))
+  end
+end
+
+---Fuzzy-pick a column and jump to it — for wide tables.
+function M.pick_column()
+  if not state.result then
+    return
+  end
+  local cols = state.result.columns
+  vim.ui.select(cols, {
+    prompt = "Column",
+    format_item = function(c)
+      return c.name .. "  (" .. (c.type or "") .. ")"
+    end,
+  }, function(_, idx)
+    if idx then
+      goto_column(idx)
+    end
+  end)
+end
+
+---Winbar shows where you are in wide tables: column n/total, name, type.
+function M.update_winbar()
+  if not (state.win and vim.api.nvim_win_is_valid(state.win) and state.result) then
+    return
+  end
+  local i = M.current_column()
+  if not i then
+    vim.wo[state.win].winbar = ""
+    return
+  end
+  local col = state.result.columns[i]
+  local text = ("col %d/%d: %s (%s)"):format(i, #state.result.columns, col.name, col.type or "?")
+  vim.wo[state.win].winbar = text:gsub("%%", "%%%%")
 end
 
 ---Cell under the cursor in the grid window, or nil.

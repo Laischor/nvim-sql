@@ -122,7 +122,9 @@ sources = {
 Suggestions need an active connection (`:Sqledit connect`). Quoted
 identifiers in alias definitions are not resolved yet.
 
-Grid keys: `c` edit cell, `gd` follow foreign key, `r` re-run query, `q` close.
+Grid keys: `c` edit cell, `gd` follow foreign key, `w`/`b` next/previous
+column, `gc` jump to column by name, `r` re-run query, `q` close. The
+winbar shows the current column (`col 4/23: created_at (timestamptz)`).
 
 `:checkhealth sqledit` verifies backend binary and config.
 
@@ -137,5 +139,9 @@ Grid keys: `c` edit cell, `gd` follow foreign key, `r` re-run query, `q` close.
 make build   # builds bin/sqledit (the Go backend)
 make test
 ```
+
+Postgres integration tests run when `SQLEDIT_TEST_PG` points at a
+scratch database (`postgres://user:pass@localhost:5432/db`); they are
+skipped otherwise.
 
 Protocol between Lua and Go: [docs/protocol.md](docs/protocol.md).
