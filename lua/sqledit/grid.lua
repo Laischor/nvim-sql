@@ -10,8 +10,11 @@ local rpc = require("sqledit.rpc")
 local M = {}
 
 local state = {
-  buf = nil,
+  buf = nil, -- data rows
   win = nil,
+  header_buf = nil, -- sticky column names, 1-line window above the data
+  header_win = nil,
+  status_text = nil, -- shown in the data window's winbar
   result = nil,
   meta = nil, -- {conn, adapter, prod, sql, source = {schema, table_}|nil, rerun}
   ranges = nil, -- per data row: per column {byte_start, byte_stop}
@@ -19,7 +22,6 @@ local state = {
 }
 
 local MAX_CELL_WIDTH = 60
-local HEADER_LINES = 3 -- status, header, rule
 
 local function notify_err(msg)
   vim.notify("sqledit: " .. msg, vim.log.levels.ERROR)
@@ -68,57 +70,124 @@ local function quote_ident(name)
   return '"' .. name:gsub('"', '""') .. '"'
 end
 
-local function ensure_window()
+local function ensure_buffers()
   if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
-    if state.win and vim.api.nvim_win_is_valid(state.win) then
-      return
-    end
-  else
-    state.buf = vim.api.nvim_create_buf(false, true)
-    vim.bo[state.buf].buftype = "nofile"
-    vim.bo[state.buf].bufhidden = "hide"
-    vim.bo[state.buf].swapfile = false
-    vim.bo[state.buf].filetype = "sqledit_grid"
-    vim.api.nvim_buf_set_name(state.buf, "sqledit://results")
-    vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = state.buf, nowait = true })
-    vim.keymap.set("n", "c", function()
-      M.edit_cell()
-    end, { buffer = state.buf, nowait = true, desc = "sqledit: edit cell" })
-    vim.keymap.set("n", "r", function()
-      if state.meta and state.meta.rerun then
-        state.meta.rerun()
-      end
-    end, { buffer = state.buf, desc = "sqledit: re-run query" })
-    vim.keymap.set("n", "gd", function()
-      M.fk_jump()
-    end, { buffer = state.buf, nowait = true, desc = "sqledit: follow foreign key" })
-    vim.keymap.set("n", "w", function()
-      M.next_column()
-    end, { buffer = state.buf, desc = "sqledit: next column" })
-    vim.keymap.set("n", "b", function()
-      M.prev_column()
-    end, { buffer = state.buf, desc = "sqledit: previous column" })
-    vim.keymap.set("n", "gc", function()
-      M.pick_column()
-    end, { buffer = state.buf, nowait = true, desc = "sqledit: jump to column" })
-    local group = vim.api.nvim_create_augroup("sqledit_grid", { clear = true })
-    vim.api.nvim_create_autocmd("CursorMoved", {
-      group = group,
-      buffer = state.buf,
-      callback = function()
-        M.update_winbar()
-      end,
-    })
+    return
   end
+  state.buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[state.buf].buftype = "nofile"
+  vim.bo[state.buf].bufhidden = "hide"
+  vim.bo[state.buf].swapfile = false
+  vim.bo[state.buf].filetype = "sqledit_grid"
+  vim.api.nvim_buf_set_name(state.buf, "sqledit://results")
+
+  state.header_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[state.header_buf].buftype = "nofile"
+  vim.bo[state.header_buf].bufhidden = "hide"
+  vim.bo[state.header_buf].swapfile = false
+  vim.api.nvim_buf_set_name(state.header_buf, "sqledit://header")
+
+  for _, buf in ipairs({ state.buf, state.header_buf }) do
+    vim.keymap.set("n", "q", function()
+      M.close()
+    end, { buffer = buf, nowait = true, desc = "sqledit: close grid" })
+  end
+  vim.keymap.set("n", "c", function()
+    M.edit_cell()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: edit cell" })
+  vim.keymap.set("n", "r", function()
+    if state.meta and state.meta.rerun then
+      state.meta.rerun()
+    end
+  end, { buffer = state.buf, desc = "sqledit: re-run query" })
+  vim.keymap.set("n", "gd", function()
+    M.fk_jump()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: follow foreign key" })
+  vim.keymap.set("n", "w", function()
+    M.next_column()
+  end, { buffer = state.buf, desc = "sqledit: next column" })
+  vim.keymap.set("n", "b", function()
+    M.prev_column()
+  end, { buffer = state.buf, desc = "sqledit: previous column" })
+  vim.keymap.set("n", "gc", function()
+    M.pick_column()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: jump to column" })
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
+    buffer = state.buf,
+    callback = function()
+      M.update_winbar()
+    end,
+  })
+end
+
+---Mirror the data window's horizontal scroll into the header window.
+local function sync_header_scroll()
+  if
+    not (state.win and vim.api.nvim_win_is_valid(state.win))
+    or not (state.header_win and vim.api.nvim_win_is_valid(state.header_win))
+  then
+    return
+  end
+  local leftcol = vim.api.nvim_win_call(state.win, function()
+    return vim.fn.winsaveview().leftcol
+  end)
+  vim.api.nvim_win_call(state.header_win, function()
+    vim.fn.winrestview({ topline = 1, lnum = 1, leftcol = leftcol })
+  end)
+end
+
+function M.close()
+  for _, win in ipairs({ state.win, state.header_win }) do
+    if win and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, false)
+    end
+  end
+  state.win, state.header_win = nil, nil
+end
+
+local function ensure_windows()
+  ensure_buffers()
+  local data_ok = state.win and vim.api.nvim_win_is_valid(state.win)
+  local header_ok = state.header_win and vim.api.nvim_win_is_valid(state.header_win)
+  if data_ok and header_ok then
+    return
+  end
+  M.close() -- drop a half-broken pair before rebuilding
+
   local prev = vim.api.nvim_get_current_win()
   vim.cmd("botright split")
   state.win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.win, state.buf)
-  vim.wo[state.win].wrap = false
-  vim.wo[state.win].number = false
-  vim.wo[state.win].relativenumber = false
-  vim.wo[state.win].signcolumn = "no"
+  vim.cmd("aboveleft 1split")
+  state.header_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(state.header_win, state.header_buf)
+
+  for _, win in ipairs({ state.win, state.header_win }) do
+    vim.wo[win].wrap = false
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].signcolumn = "no"
+  end
   vim.wo[state.win].cursorline = true
+  vim.wo[state.header_win].winfixheight = true
+  vim.wo[state.header_win].winbar = ""
+
+  local group = vim.api.nvim_create_augroup("sqledit_grid_win", { clear = true })
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = group,
+    pattern = tostring(state.win),
+    callback = sync_header_scroll,
+  })
+  -- one window of the pair closes -> take the other with it
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = group,
+    pattern = { tostring(state.win), tostring(state.header_win) },
+    callback = function()
+      vim.schedule(M.close)
+    end,
+    once = true,
+  })
   vim.api.nvim_set_current_win(prev)
 end
 
@@ -149,13 +218,11 @@ local function redraw()
     end
   end
 
-  local lines = {}
-  local header, rule = {}, {}
+  local header = {}
   for i, col in ipairs(cols) do
     header[i] = pad(col.name, widths[i], false)
-    rule[i] = string.rep("─", widths[i])
   end
-  local status = ("%s%s  •  %d row(s)%s  •  %dms%s"):format(
+  state.status_text = ("%s%s  •  %d row(s)%s  •  %dms%s"):format(
     meta.conn,
     meta.prod and "  [PROD]" or "",
     result.row_count or #rows,
@@ -163,10 +230,8 @@ local function redraw()
     result.duration_ms or 0,
     meta.source and "  •  c:edit gd:fk r:rerun" or ""
   )
-  table.insert(lines, status)
-  table.insert(lines, table.concat(header, " │ "))
-  table.insert(lines, table.concat(rule, "─┼─"))
 
+  local lines = {}
   state.ranges = {}
   for r = 1, #rows do
     local line, ranges = "", {}
@@ -182,18 +247,22 @@ local function redraw()
     table.insert(lines, line)
   end
 
-  ensure_window()
+  ensure_windows()
+  vim.bo[state.header_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(state.header_buf, 0, -1, false, { table.concat(header, " │ ") })
+  vim.bo[state.header_buf].modifiable = false
   vim.bo[state.buf].modifiable = true
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
   vim.bo[state.buf].modifiable = false
 
   local ns = vim.api.nvim_create_namespace("sqledit_grid")
-  vim.api.nvim_buf_clear_namespace(state.buf, ns, 0, -1)
-  vim.hl.range(state.buf, ns, meta.prod and "ErrorMsg" or "Comment", { 0, 0 }, { 0, -1 })
-  vim.hl.range(state.buf, ns, "Title", { 1, 0 }, { 1, -1 })
+  vim.api.nvim_buf_clear_namespace(state.header_buf, ns, 0, -1)
+  vim.hl.range(state.header_buf, ns, "Title", { 0, 0 }, { 0, -1 })
 
   local height = math.min(#lines + 1, math.max(10, math.floor(vim.o.lines * 0.4)))
   vim.api.nvim_win_set_height(state.win, height)
+  vim.api.nvim_win_set_height(state.header_win, 1)
+  sync_header_scroll()
   M.update_winbar()
 end
 
@@ -205,7 +274,7 @@ function M.render(result, meta)
   state.table_columns = nil
   redraw()
   if #(result.rows or {}) > 0 then
-    vim.api.nvim_win_set_cursor(state.win, { HEADER_LINES + 1, 0 })
+    vim.api.nvim_win_set_cursor(state.win, { 1, 0 })
   end
 end
 
@@ -273,18 +342,18 @@ function M.pick_column()
   end)
 end
 
----Winbar shows where you are in wide tables: column n/total, name, type.
+---Winbar carries the status line plus, in wide tables, where you are:
+---column n/total, name, type.
 function M.update_winbar()
   if not (state.win and vim.api.nvim_win_is_valid(state.win) and state.result) then
     return
   end
+  local text = state.status_text or ""
   local i = M.current_column()
-  if not i then
-    vim.wo[state.win].winbar = ""
-    return
+  if i then
+    local col = state.result.columns[i]
+    text = ("col %d/%d: %s (%s)  •  %s"):format(i, #state.result.columns, col.name, col.type or "?", text)
   end
-  local col = state.result.columns[i]
-  local text = ("col %d/%d: %s (%s)"):format(i, #state.result.columns, col.name, col.type or "?")
   vim.wo[state.win].winbar = text:gsub("%%", "%%%%")
 end
 
@@ -294,7 +363,7 @@ local function cell_at_cursor()
     return nil
   end
   local pos = vim.api.nvim_win_get_cursor(state.win)
-  local row = pos[1] - HEADER_LINES
+  local row = pos[1]
   if row < 1 or row > #state.result.rows then
     return nil
   end

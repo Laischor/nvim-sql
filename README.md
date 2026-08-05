@@ -129,8 +129,11 @@ Suggestions need an active connection (`:Sqledit connect`);
 identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell, `gd` follow foreign key, `w`/`b` next/previous
-column, `gc` jump to column by name, `r` re-run query, `q` close. The
-winbar shows the current column (`col 4/23: created_at (timestamptz)`).
+column, `gc` jump to column by name, `r` re-run query, `q` close. Column
+names stay sticky in a header line above the grid — it follows
+horizontal scrolling and survives vertical scrolling. The winbar shows
+the current column (`col 4/23: created_at (timestamptz)`) plus the
+result status.
 
 `:checkhealth sqledit` verifies backend binary and config.
 
