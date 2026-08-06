@@ -118,6 +118,14 @@ local function ensure_buffers()
   vim.keymap.set("n", "F", function()
     require("sqledit").refilter()
   end, { buffer = state.buf, desc = "sqledit: edit filter clauses" })
+  for key, fmt in pairs({ yc = "csv", yj = "json", yi = "insert" }) do
+    vim.keymap.set({ "n", "x" }, key, function()
+      M.yank(fmt)
+    end, { buffer = state.buf, nowait = true, desc = "sqledit: yank rows as " .. fmt })
+  end
+  vim.keymap.set("n", "p", function()
+    M.paste()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: insert rows from register" })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
     buffer = state.buf,
@@ -632,6 +640,170 @@ local function editable_or_complain()
   return true
 end
 
+---Row indices for the current action: visual selection when active
+---(leaves visual mode), else the cursor row.
+local function selected_rows()
+  local total = #state.result.rows
+  if total == 0 then
+    return nil
+  end
+  local mode = vim.fn.mode()
+  if mode == "v" or mode == "V" or mode == "\22" then
+    vim.cmd([[execute "normal! \<esc>"]])
+    local first = vim.api.nvim_buf_get_mark(state.buf, "<")[1]
+    local last = vim.api.nvim_buf_get_mark(state.buf, ">")[1]
+    first, last = math.max(1, math.min(first, last)), math.min(total, math.max(first, last))
+    local rows = {}
+    for r = first, last do
+      table.insert(rows, r)
+    end
+    return rows
+  end
+  local pos = vim.api.nvim_win_get_cursor(state.win)
+  if pos[1] > total then
+    return nil
+  end
+  return { pos[1] }
+end
+
+---Yank rows as csv/json/insert into the unnamed register and, when
+---available, the system clipboard.
+function M.yank(fmt)
+  if not state.result then
+    return
+  end
+  local rows_idx = selected_rows()
+  if not rows_idx then
+    notify_err("no rows to yank")
+    return
+  end
+  local transfer = require("sqledit.transfer")
+  local cols = {}
+  for i, c in ipairs(state.result.columns) do
+    cols[i] = c.name
+  end
+  local rows = {}
+  for _, r in ipairs(rows_idx) do
+    table.insert(rows, state.result.rows[r])
+  end
+  local function finish(text)
+    vim.fn.setreg('"', text)
+    pcall(vim.fn.setreg, "+", text)
+    vim.notify(("sqledit: yanked %d row(s) as %s"):format(#rows, fmt))
+  end
+  if fmt == "csv" then
+    finish(transfer.to_csv(cols, rows))
+  elseif fmt == "json" then
+    finish(transfer.to_json(cols, rows))
+  else
+    local src = state.meta.source
+    if not src then
+      notify_err("INSERT yank needs a single-table SELECT (source table unknown)")
+      return
+    end
+    -- resolves the schema of an unqualified table as a side effect
+    get_table_columns(function()
+      finish(transfer.to_insert(src.schema, src.table_, cols, rows))
+    end)
+  end
+end
+
+---Insert rows from the register (CSV or JSON, auto-detected) into the
+---grid's source table on the CURRENT connection, then re-run the query.
+function M.paste()
+  if not editable_or_complain() then
+    return
+  end
+  local text = ""
+  local ok, clip = pcall(vim.fn.getreg, "+")
+  if ok and clip ~= "" then
+    text = clip
+  else
+    text = vim.fn.getreg('"')
+  end
+  local transfer = require("sqledit.transfer")
+  local cols, rows = transfer.parse(text)
+  if not cols then
+    notify_err("paste: " .. rows)
+    return
+  end
+  get_table_columns(function(table_cols)
+    local known = {}
+    for _, c in ipairs(table_cols) do
+      known[c.name] = true
+    end
+    local keep, dropped = {}, {}
+    for i, name in ipairs(cols) do
+      if known[name] then
+        table.insert(keep, { idx = i, name = name })
+      else
+        table.insert(dropped, name)
+      end
+    end
+    if #keep == 0 then
+      notify_err("paste: no matching columns on " .. state.meta.source.table_)
+      return
+    end
+
+    local placeholder = function(n)
+      return state.meta.adapter == "postgres" and ("$" .. n) or "?"
+    end
+    local params, tuples, names = {}, {}, {}
+    for i, k in ipairs(keep) do
+      names[i] = quote_ident(k.name)
+    end
+    for _, row in ipairs(rows) do
+      local vals = {}
+      for i, k in ipairs(keep) do
+        local v = row[k.idx]
+        if v == nil or v == vim.NIL then
+          table.insert(params, vim.NIL)
+        elseif type(v) == "table" then
+          table.insert(params, vim.json.encode(v))
+        else
+          table.insert(params, tostring(v))
+        end
+        vals[i] = placeholder(#params)
+      end
+      table.insert(tuples, "(" .. table.concat(vals, ", ") .. ")")
+    end
+    local src = state.meta.source
+    local sql = ("INSERT INTO %s.%s (%s) VALUES %s"):format(
+      quote_ident(src.schema),
+      quote_ident(src.table_),
+      table.concat(names, ", "),
+      table.concat(tuples, ", ")
+    )
+
+    local col_names = vim.tbl_map(function(k)
+      return k.name
+    end, keep)
+    local prompt = ("Insert %d row(s) into %s.%s on %s%s?\n\n  columns: %s%s"):format(
+      #rows,
+      src.schema,
+      src.table_,
+      state.meta.conn,
+      state.meta.prod and " [PROD]" or "",
+      table.concat(col_names, ", "),
+      #dropped > 0 and ("\n  ignored (not on table): " .. table.concat(dropped, ", ")) or ""
+    )
+    if vim.fn.confirm(prompt, "&Yes\n&No", 2, state.meta.prod and "Warning" or "Question") ~= 1 then
+      return
+    end
+
+    rpc.request("query", { id = state.meta.conn, sql = sql, params = params }, function(err, res)
+      if err then
+        notify_err(err)
+        return
+      end
+      vim.notify(("sqledit: inserted %d row(s) into %s.%s"):format(res.rows_affected or 0, src.schema, src.table_))
+      if state.meta.rerun then
+        state.meta.rerun()
+      end
+    end)
+  end)
+end
+
 ---Edit the cell under the cursor.
 function M.edit_cell()
   if not editable_or_complain() then
@@ -650,23 +822,11 @@ function M.edit_cells()
   if not editable_or_complain() then
     return
   end
-  vim.cmd([[execute "normal! \<esc>"]])
-  local first = vim.api.nvim_buf_get_mark(state.buf, "<")[1]
-  local last = vim.api.nvim_buf_get_mark(state.buf, ">")[1]
-  local total = #state.result.rows
-  first, last = math.max(1, math.min(first, last)), math.min(total, math.max(first, last))
-  if first > last or total == 0 then
+  local rows = selected_rows()
+  local col = M.current_column()
+  if not rows or not col then
     notify_err("no rows selected")
     return
-  end
-  local col = M.current_column()
-  if not col then
-    notify_err("no cell under cursor")
-    return
-  end
-  local rows = {}
-  for r = first, last do
-    table.insert(rows, r)
   end
   start_edit(rows, col)
 end

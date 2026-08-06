@@ -26,6 +26,11 @@ editing instead of a re-implementation.
   `r` re-runs the query.
 - **FK jump** — `gd` on a foreign-key cell opens the referenced row.
   Works recursively: the target grid is a normal grid.
+- **Copy & paste between servers** — yank rows as CSV (`yc`), JSON
+  (`yj`) or a ready INSERT statement (`yi`) into register + clipboard;
+  `p` in any grid parses CSV/JSON from the clipboard and inserts into
+  that grid's table on the current connection (confirmed, columns
+  matched by name, extras ignored). Copy prod → switch → paste staging.
 - **Query history** — `:Sqledit history` fuzzy-picks from this
   connection's past queries (persisted across sessions) and opens the
   pick in a query buffer — it never executes directly.
@@ -141,6 +146,8 @@ Suggestions need an active connection (`:Sqledit connect`);
 identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell (visual: edit column for selected rows),
+`yc`/`yj`/`yi` yank row(s) as CSV/JSON/INSERT (visual: selection),
+`p` insert clipboard rows into this grid's table,
 `gd` follow foreign key, `w`/`b` next/previous
 column, `gc` jump to column by name, `F` edit the last filter's
 `WHERE`/`ORDER BY`, `r` re-run query, `q` close. Column
