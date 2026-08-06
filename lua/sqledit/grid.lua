@@ -95,6 +95,9 @@ local function ensure_buffers()
   vim.keymap.set("n", "c", function()
     M.edit_cell()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: edit cell" })
+  vim.keymap.set("x", "c", function()
+    M.edit_cells()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: edit column for selected rows" })
   vim.keymap.set("n", "r", function()
     if state.meta and state.meta.rerun then
       state.meta.rerun()
@@ -426,7 +429,9 @@ local function to_input(v)
   return tostring(v)
 end
 
-local function apply_update(row, col, input)
+---Write `input` into column `col` of the given row indices via one
+---parameterized UPDATE.
+local function apply_update(rows, col, input)
   local src = state.meta.source
   local result = state.result
   local table_cols = state.table_columns
@@ -439,30 +444,36 @@ local function apply_update(row, col, input)
     return
   end
 
-  -- map pk columns to their values in this result row
+  -- one pk-condition group per row, OR-joined — handles composite pks
+  -- and NULL pk values without row-value syntax
   local col_index = {}
   for i, c in ipairs(result.columns) do
     col_index[c.name] = i
   end
-  local where, params = {}, {}
+  local params = {}
   local new_value = input == "NULL" and vim.NIL or input
   table.insert(params, new_value)
   local placeholder = function(n)
     return state.meta.adapter == "postgres" and ("$" .. n) or "?"
   end
-  for _, pk in ipairs(pks) do
-    local i = col_index[pk.name]
-    if not i then
-      notify_err(("primary key column %q not in result — select it to edit"):format(pk.name))
-      return
+  local groups = {}
+  for _, row in ipairs(rows) do
+    local conds = {}
+    for _, pk in ipairs(pks) do
+      local i = col_index[pk.name]
+      if not i then
+        notify_err(("primary key column %q not in result — select it to edit"):format(pk.name))
+        return
+      end
+      local v = result.rows[row][i]
+      if v == nil or v == vim.NIL then
+        table.insert(conds, quote_ident(pk.name) .. " IS NULL")
+      else
+        table.insert(params, tostring(v))
+        table.insert(conds, quote_ident(pk.name) .. " = " .. placeholder(#params))
+      end
     end
-    local v = result.rows[row][i]
-    if v == nil or v == vim.NIL then
-      table.insert(where, quote_ident(pk.name) .. " IS NULL")
-    else
-      table.insert(params, tostring(v))
-      table.insert(where, quote_ident(pk.name) .. " = " .. placeholder(#params))
-    end
+    table.insert(groups, "(" .. table.concat(conds, " AND ") .. ")")
   end
 
   local col_name = result.columns[col].name
@@ -471,16 +482,25 @@ local function apply_update(row, col, input)
     quote_ident(src.table_),
     quote_ident(col_name),
     placeholder(1),
-    table.concat(where, " AND ")
+    table.concat(groups, " OR ")
   )
 
-  if state.meta.prod then
-    local prompt = ("Run on PROD (%s)?\n\n  %s\n  values: %s"):format(
+  -- multi-row edits always confirm; single-row only on prod
+  if #rows > 1 or state.meta.prod then
+    local preview = sql
+    if #preview > 200 then
+      preview = preview:sub(1, 197) .. "..."
+    end
+    local prompt = ("Update %d row(s) on %s%s?\n\n  %s.%s = %s\n\n  %s"):format(
+      #rows,
       state.meta.conn,
-      sql,
-      vim.inspect(params):gsub("%s+", " ")
+      state.meta.prod and " [PROD]" or "",
+      src.table_,
+      col_name,
+      input,
+      preview
     )
-    if vim.fn.confirm(prompt, "&Yes\n&No", 2, "Warning") ~= 1 then
+    if vim.fn.confirm(prompt, "&Yes\n&No", 2, state.meta.prod and "Warning" or "Question") ~= 1 then
       return
     end
   end
@@ -491,20 +511,22 @@ local function apply_update(row, col, input)
       return
     end
     local affected = res.rows_affected or 0
-    if affected ~= 1 then
-      notify_err(("expected 1 row, %d affected — press r to reload"):format(affected))
+    if affected ~= #rows then
+      notify_err(("expected %d row(s), %d affected — press r to reload"):format(#rows, affected))
       return
     end
-    -- keep numbers numeric so alignment survives the local update
-    local stored = new_value
-    if stored ~= vim.NIL and tonumber(stored) ~= nil and type(result.rows[row][col]) == "number" then
-      stored = tonumber(stored)
+    for _, row in ipairs(rows) do
+      -- keep numbers numeric so alignment survives the local update
+      local stored = new_value
+      if stored ~= vim.NIL and tonumber(stored) ~= nil and type(result.rows[row][col]) == "number" then
+        stored = tonumber(stored)
+      end
+      result.rows[row][col] = stored
     end
-    result.rows[row][col] = stored
     local cursor = vim.api.nvim_win_get_cursor(state.win)
     redraw()
     vim.api.nvim_win_set_cursor(state.win, cursor)
-    vim.notify(("sqledit: updated %s.%s.%s"):format(src.schema, src.table_, col_name))
+    vim.notify(("sqledit: updated %d row(s) in %s.%s.%s"):format(#rows, src.schema, src.table_, col_name))
   end)
 end
 
@@ -564,20 +586,9 @@ function M.fk_jump()
   end)
 end
 
----Edit the cell under the cursor.
-function M.edit_cell()
-  if not (state.result and state.meta) then
-    return
-  end
-  if not state.meta.source then
-    notify_err("result not editable (needs a plain single-table SELECT)")
-    return
-  end
-  local row, col = cell_at_cursor()
-  if not row then
-    notify_err("no cell under cursor")
-    return
-  end
+---Shared entry for single- and multi-row edits: validates the column,
+---prefills the input (common value across rows, empty when mixed).
+local function start_edit(rows, col)
   get_table_columns(function(table_cols)
     local col_name = state.result.columns[col].name
     local known = false
@@ -592,17 +603,72 @@ function M.edit_cell()
         col_name, state.meta.source.schema, state.meta.source.table_))
       return
     end
-    local current = state.result.rows[row][col]
-    vim.ui.input({
-      prompt = ("%s.%s = "):format(state.meta.source.table_, col_name),
-      default = to_input(current),
-    }, function(input)
+    local prefill = to_input(state.result.rows[rows[1]][col])
+    for _, row in ipairs(rows) do
+      if to_input(state.result.rows[row][col]) ~= prefill then
+        prefill = ""
+        break
+      end
+    end
+    local prompt = #rows > 1 and ("%s.%s (%d rows) = "):format(state.meta.source.table_, col_name, #rows)
+      or ("%s.%s = "):format(state.meta.source.table_, col_name)
+    vim.ui.input({ prompt = prompt, default = prefill }, function(input)
       if input == nil then -- cancelled
         return
       end
-      apply_update(row, col, input)
+      apply_update(rows, col, input)
     end)
   end)
+end
+
+local function editable_or_complain()
+  if not (state.result and state.meta) then
+    return false
+  end
+  if not state.meta.source then
+    notify_err("result not editable (needs a plain single-table SELECT)")
+    return false
+  end
+  return true
+end
+
+---Edit the cell under the cursor.
+function M.edit_cell()
+  if not editable_or_complain() then
+    return
+  end
+  local row, col = cell_at_cursor()
+  if not row then
+    notify_err("no cell under cursor")
+    return
+  end
+  start_edit({ row }, col)
+end
+
+---Edit one column across the visually selected rows (one UPDATE).
+function M.edit_cells()
+  if not editable_or_complain() then
+    return
+  end
+  vim.cmd([[execute "normal! \<esc>"]])
+  local first = vim.api.nvim_buf_get_mark(state.buf, "<")[1]
+  local last = vim.api.nvim_buf_get_mark(state.buf, ">")[1]
+  local total = #state.result.rows
+  first, last = math.max(1, math.min(first, last)), math.min(total, math.max(first, last))
+  if first > last or total == 0 then
+    notify_err("no rows selected")
+    return
+  end
+  local col = M.current_column()
+  if not col then
+    notify_err("no cell under cursor")
+    return
+  end
+  local rows = {}
+  for r = first, last do
+    table.insert(rows, r)
+  end
+  start_edit(rows, col)
 end
 
 return M

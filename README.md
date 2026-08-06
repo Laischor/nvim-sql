@@ -18,10 +18,12 @@ editing instead of a re-implementation.
   `table.` (aliases resolved from the buffer), tables after `schema.`.
   Cached per connection; `:Sqledit refresh` after DDL.
 - **Editable grid** — `c` on a cell opens an input and writes the change
-  back as a parameterized `UPDATE … WHERE <pk>`. Only for plain
-  single-table SELECTs with the primary key in the result; everything
-  else stays read-only. `NULL` as input means SQL NULL, `r` re-runs the
-  query.
+  back as a parameterized `UPDATE … WHERE <pk>`. Visually select rows
+  and press `c` to set one column across all of them in a single UPDATE
+  (always confirmed, with row count and statement preview). Only for
+  plain single-table SELECTs with the primary key in the result;
+  everything else stays read-only. `NULL` as input means SQL NULL,
+  `r` re-runs the query.
 - **FK jump** — `gd` on a foreign-key cell opens the referenced row.
   Works recursively: the target grid is a normal grid.
 - **Query history** — `:Sqledit history` fuzzy-picks from this
@@ -138,7 +140,8 @@ Suggestions need an active connection (`:Sqledit connect`);
 `:checkhealth sqledit` shows the registration status. Quoted
 identifiers in alias definitions are not resolved yet.
 
-Grid keys: `c` edit cell, `gd` follow foreign key, `w`/`b` next/previous
+Grid keys: `c` edit cell (visual: edit column for selected rows),
+`gd` follow foreign key, `w`/`b` next/previous
 column, `gc` jump to column by name, `F` edit the last filter's
 `WHERE`/`ORDER BY`, `r` re-run query, `q` close. Column
 names stay sticky in a header line above the grid — it follows
