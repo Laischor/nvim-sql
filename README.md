@@ -22,7 +22,9 @@ editing instead of a re-implementation.
   and press `c` to set one column across all of them in a single UPDATE
   (always confirmed, with row count and statement preview). Only for
   plain single-table SELECTs with the primary key in the result;
-  everything else stays read-only. `NULL` as input means SQL NULL,
+  everything else stays read-only. Input semantics: `NULL` = SQL NULL,
+  `''` = empty string, empty input = no change (NULL cells prefill
+  empty). `dd` / visual `d` deletes rows — always behind a confirm.
   `r` re-runs the query.
 - **FK jump** — `gd` on a foreign-key cell opens the referenced row.
   Works recursively: the target grid is a normal grid.
@@ -152,6 +154,7 @@ Suggestions need an active connection (`:Sqledit connect`);
 identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell (visual: edit column for selected rows),
+`dd`/visual `d` delete row(s) with confirm,
 `yc`/`yj`/`yi` yank row(s) as CSV/JSON/INSERT (visual: selection),
 `p` insert clipboard rows into this grid's table, `o` insert-row form,
 `gd` follow foreign key, `w`/`b` next/previous

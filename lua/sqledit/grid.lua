@@ -129,6 +129,12 @@ local function ensure_buffers()
   vim.keymap.set("n", "o", function()
     M.insert_row()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: insert new row (form)" })
+  vim.keymap.set("n", "dd", function()
+    M.delete_rows()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: delete row" })
+  vim.keymap.set("x", "d", function()
+    M.delete_rows()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: delete selected rows" })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
     buffer = state.buf,
@@ -440,32 +446,25 @@ local function to_input(v)
   return tostring(v)
 end
 
----Write `input` into column `col` of the given row indices via one
----parameterized UPDATE.
-local function apply_update(rows, col, input)
+local function placeholder(n)
+  return state.meta.adapter == "postgres" and ("$" .. n) or "?"
+end
+
+---One pk-condition group per row, OR-joined — handles composite pks and
+---NULL pk values without row-value syntax. Appends pk values to params.
+---Returns the groups, or nil + error message.
+local function build_pk_where(table_cols, rows, params)
   local src = state.meta.source
   local result = state.result
-  local table_cols = state.table_columns
-
   local pks = vim.tbl_filter(function(c)
     return c.pk
   end, table_cols)
   if #pks == 0 then
-    notify_err(("%s.%s has no primary key — read-only"):format(src.schema, src.table_))
-    return
+    return nil, ("%s.%s has no primary key — read-only"):format(src.schema, src.table_)
   end
-
-  -- one pk-condition group per row, OR-joined — handles composite pks
-  -- and NULL pk values without row-value syntax
   local col_index = {}
   for i, c in ipairs(result.columns) do
     col_index[c.name] = i
-  end
-  local params = {}
-  local new_value = input == "NULL" and vim.NIL or input
-  table.insert(params, new_value)
-  local placeholder = function(n)
-    return state.meta.adapter == "postgres" and ("$" .. n) or "?"
   end
   local groups = {}
   for _, row in ipairs(rows) do
@@ -473,8 +472,7 @@ local function apply_update(rows, col, input)
     for _, pk in ipairs(pks) do
       local i = col_index[pk.name]
       if not i then
-        notify_err(("primary key column %q not in result — select it to edit"):format(pk.name))
-        return
+        return nil, ("primary key column %q not in result — select it to edit"):format(pk.name)
       end
       local v = result.rows[row][i]
       if v == nil or v == vim.NIL then
@@ -485,6 +483,36 @@ local function apply_update(rows, col, input)
       end
     end
     table.insert(groups, "(" .. table.concat(conds, " AND ") .. ")")
+  end
+  return groups
+end
+
+---Write `input` into column `col` of the given row indices via one
+---parameterized UPDATE. Input semantics: "NULL" = SQL NULL, '' = empty
+---string, empty input = no change.
+local function apply_update(rows, col, input)
+  local src = state.meta.source
+  local result = state.result
+  local table_cols = state.table_columns
+
+  if input == "" then
+    vim.notify("sqledit: no change (NULL for null, '' for empty string)")
+    return
+  end
+  local new_value
+  if input == "NULL" then
+    new_value = vim.NIL
+  elseif input == "''" then
+    new_value = ""
+  else
+    new_value = input
+  end
+
+  local params = { new_value }
+  local groups, gerr = build_pk_where(table_cols, rows, params)
+  if not groups then
+    notify_err(gerr)
+    return
   end
 
   local col_name = result.columns[col].name
@@ -614,9 +642,17 @@ local function start_edit(rows, col)
         col_name, state.meta.source.schema, state.meta.source.table_))
       return
     end
-    local prefill = to_input(state.result.rows[rows[1]][col])
+    -- NULL prefills empty (no need to delete "NULL" before typing);
+    -- setting NULL is done by typing the literal NULL
+    local function prefill_text(v)
+      if v == nil or v == vim.NIL then
+        return ""
+      end
+      return to_input(v)
+    end
+    local prefill = prefill_text(state.result.rows[rows[1]][col])
     for _, row in ipairs(rows) do
-      if to_input(state.result.rows[row][col]) ~= prefill then
+      if prefill_text(state.result.rows[row][col]) ~= prefill then
         prefill = ""
         break
       end
@@ -804,9 +840,6 @@ function M.paste()
       return
     end
 
-    local placeholder = function(n)
-      return state.meta.adapter == "postgres" and ("$" .. n) or "?"
-    end
     local params, tuples, names = {}, {}, {}
     for i, k in ipairs(keep) do
       names[i] = quote_ident(k.name)
@@ -842,6 +875,72 @@ function M.paste()
       if state.meta.rerun then
         state.meta.rerun()
       end
+    end)
+  end)
+end
+
+---Delete the selected rows (or the cursor row) — always confirmed.
+function M.delete_rows()
+  if not editable_or_complain() then
+    return
+  end
+  local rows = selected_rows()
+  if not rows then
+    notify_err("no rows selected")
+    return
+  end
+  get_table_columns(function(table_cols)
+    local src = state.meta.source
+    local result = state.result
+    local params = {}
+    local groups, gerr = build_pk_where(table_cols, rows, params)
+    if not groups then
+      notify_err(gerr)
+      return
+    end
+    local sql = ("DELETE FROM %s.%s WHERE %s"):format(
+      quote_ident(src.schema),
+      quote_ident(src.table_),
+      table.concat(groups, " OR ")
+    )
+    local preview = sql
+    if #preview > 200 then
+      preview = preview:sub(1, 197) .. "..."
+    end
+    local prompt = ("Delete %d row(s) from %s.%s on %s%s?\n\n  %s"):format(
+      #rows,
+      src.schema,
+      src.table_,
+      state.meta.conn,
+      state.meta.prod and " [PROD]" or "",
+      preview
+    )
+    if vim.fn.confirm(prompt, "&Delete\n&Cancel", 2, "Warning") ~= 1 then
+      return
+    end
+    rpc.request("query", { id = state.meta.conn, sql = sql, params = params }, function(err, res)
+      if err then
+        notify_err(err)
+        return
+      end
+      local affected = res.rows_affected or 0
+      if affected ~= #rows then
+        notify_err(("expected %d row(s), %d affected — press r to reload"):format(#rows, affected))
+        return
+      end
+      table.sort(rows, function(a, b)
+        return a > b
+      end)
+      for _, r in ipairs(rows) do
+        table.remove(result.rows, r)
+      end
+      result.row_count = #result.rows
+      local cursor = vim.api.nvim_win_get_cursor(state.win)
+      redraw()
+      if #result.rows > 0 then
+        vim.api.nvim_win_set_cursor(state.win, { math.min(cursor[1], #result.rows), cursor[2] })
+      end
+      vim.notify(("sqledit: deleted %d row(s) from %s.%s"):format(#rows, src.schema, src.table_))
     end)
   end)
 end
@@ -903,9 +1002,6 @@ function M.insert_row()
     vim.api.nvim_create_autocmd("BufWriteCmd", {
       buffer = buf,
       callback = function()
-        local placeholder = function(n)
-          return state.meta.adapter == "postgres" and ("$" .. n) or "?"
-        end
         local names, vals, params = {}, {}, {}
         for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
           local name, value = line:match("^%s*([%w_]+)%s*=%s*(.*)$")

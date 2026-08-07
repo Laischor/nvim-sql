@@ -105,6 +105,19 @@ local function drain(ms)
   end, 50)
 end
 
+local err_msgs = {}
+local function capture_notify()
+  err_msgs = {}
+  vim.notify = function(msg)
+    if type(msg) == "string" then
+      table.insert(err_msgs, msg)
+    end
+  end
+end
+local function last_err()
+  return err_msgs[#err_msgs] or "?"
+end
+
 -- ------------------------------------------------------- backend + connect
 local err = rpc.start({ backend = root .. "/bin/sqledit", config_file = config_file })
 step("backend start", err == nil, err)
@@ -255,18 +268,31 @@ drain(500)
 qerr, qres = query_sync("SELECT weight FROM pets WHERE id = 1")
 step("edit: NULL literal", qerr == nil and qres.rows[1][1] == vim.NIL, vim.inspect(qres and qres.rows))
 
-local err_msgs = {}
-local function capture_notify()
-  err_msgs = {}
-  vim.notify = function(msg)
-    if type(msg) == "string" then
-      table.insert(err_msgs, msg)
-    end
-  end
-end
-local function last_err()
-  return err_msgs[#err_msgs] or "?"
-end
+-- NULL cell prefills empty
+input_default = "?"
+next_input = nil -- cancel
+grid.edit_cell()
+drain(300)
+step("edit: NULL prefills empty", input_default == "", input_default)
+
+-- '' sets an empty string
+next_input = "''"
+grid.edit_cell()
+drain(500)
+qerr, qres = query_sync("SELECT weight FROM pets WHERE id = 1")
+step("edit: '' means empty string", qerr == nil and qres.rows[1][1] == "", vim.inspect(qres and qres.rows))
+
+-- empty input changes nothing
+capture_notify()
+next_input = ""
+grid.edit_cell()
+vim.wait(3000, function()
+  return last_err():match("no change") ~= nil
+end)
+qerr, qres = query_sync("SELECT weight FROM pets WHERE id = 1")
+step("edit: empty input is a no-op", last_err():match("no change") ~= nil and qres.rows[1][1] == "", last_err())
+vim.notify = orig_notify
+query_sync("UPDATE pets SET weight = NULL WHERE id = 1")
 
 capture_notify()
 sqledit.run("SELECT count(*) AS n FROM pets")
@@ -526,6 +552,53 @@ qerr, qres = query_sync("SELECT weight FROM pets_copy WHERE name = 'formy'")
 step("form: row inserted, empty pk omitted", qres ~= nil and #qres.rows == 1, vim.inspect(qres and qres.rows))
 step("form: NULL literal", qres ~= nil and qres.rows[1][1] == vim.NIL, vim.inspect(qres and qres.rows))
 step("form: closed after insert", not vim.api.nvim_buf_is_valid(form_buf))
+
+-- delete rows (dd / visual d) — always confirmed
+sqledit.run("SELECT id, name, weight FROM pets_copy ORDER BY id")
+vim.wait(3000, function()
+  return grid_text():match("formy") ~= nil
+end)
+qerr, qres = query_sync("SELECT count(*) FROM pets_copy")
+local before_del = qres.rows[1][1]
+vim.api.nvim_set_current_win(grid_win())
+vim.api.nvim_win_set_cursor(grid_win(), { 1, 0 })
+confirm_prompts = {}
+grid.delete_rows()
+vim.wait(5000, function()
+  local e, r = query_sync("SELECT count(*) FROM pets_copy")
+  return r and r.rows[1][1] == before_del - 1
+end)
+qerr, qres = query_sync("SELECT count(*) FROM pets_copy")
+step("delete: single row via dd", qres.rows[1][1] == before_del - 1, tostring(qres.rows[1][1]))
+step("delete: always confirmed", confirm_prompts[1] ~= nil and confirm_prompts[1]:match("Delete 1 row") ~= nil, confirm_prompts[1])
+step("delete: grid shrunk locally", #grid_lines() == before_del - 1, tostring(#grid_lines()))
+
+vim.api.nvim_win_set_cursor(grid_win(), { 1, 0 })
+vim.cmd("normal! Vj")
+confirm_prompts = {}
+grid.delete_rows()
+vim.wait(5000, function()
+  local e, r = query_sync("SELECT count(*) FROM pets_copy")
+  return r and r.rows[1][1] == before_del - 3
+end)
+qerr, qres = query_sync("SELECT count(*) FROM pets_copy")
+step("delete: visual selection", qres.rows[1][1] == before_del - 3, tostring(qres.rows[1][1]))
+step("delete: confirm has count", confirm_prompts[1] ~= nil and confirm_prompts[1]:match("Delete 2 row") ~= nil, confirm_prompts[1])
+
+-- cancel keeps everything
+vim.fn.confirm = function(prompt)
+  table.insert(confirm_prompts, prompt)
+  return 2
+end
+vim.api.nvim_win_set_cursor(grid_win(), { 1, 0 })
+grid.delete_rows()
+drain(500)
+qerr, qres = query_sync("SELECT count(*) FROM pets_copy")
+step("delete: cancel is a no-op", qres.rows[1][1] == before_del - 3, tostring(qres.rows[1][1]))
+vim.fn.confirm = function(prompt)
+  table.insert(confirm_prompts, prompt)
+  return 1
+end
 
 -- ---------------------------------------------------------- filter/refilter
 vim.ui.select = function(items, _, on_choice)
