@@ -200,7 +200,17 @@ function M.parse(text)
   if text:sub(1, 1) == "[" or text:sub(1, 1) == "{" then
     return parse_json(text)
   end
-  return parse_csv(text)
+  if text:upper():match("^INSERT%f[%W]") then
+    return nil, "register holds an INSERT statement (yi) — run it in a query buffer; grid paste needs CSV (yc) or JSON (yj)"
+  end
+  local cols, rows = parse_csv(text)
+  if not cols then
+    return nil, rows
+  end
+  for i, name in ipairs(cols) do
+    cols[i] = vim.trim(name)
+  end
+  return cols, rows
 end
 
 return M

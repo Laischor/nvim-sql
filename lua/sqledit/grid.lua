@@ -126,6 +126,9 @@ local function ensure_buffers()
   vim.keymap.set("n", "p", function()
     M.paste()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: insert rows from register" })
+  vim.keymap.set("n", "o", function()
+    M.insert_row()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: insert new row (form)" })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
     buffer = state.buf,
@@ -728,20 +731,76 @@ function M.paste()
     return
   end
   get_table_columns(function(table_cols)
-    local known = {}
+    -- match by exact name, falling back to case-insensitive (postgres
+    -- folds unquoted identifiers; external CSV headers vary)
+    local known, known_ci = {}, {}
     for _, c in ipairs(table_cols) do
-      known[c.name] = true
+      known[c.name] = c.name
+      known_ci[c.name:lower()] = c.name
     end
     local keep, dropped = {}, {}
     for i, name in ipairs(cols) do
-      if known[name] then
-        table.insert(keep, { idx = i, name = name })
+      local target = known[name] or known_ci[name:lower()]
+      if target then
+        table.insert(keep, { idx = i, name = target })
       else
         table.insert(dropped, name)
       end
     end
     if #keep == 0 then
-      notify_err("paste: no matching columns on " .. state.meta.source.table_)
+      local table_names = vim.tbl_map(function(c)
+        return c.name
+      end, table_cols)
+      notify_err(("paste: no matching columns on %s\n  payload: %s\n  table:   %s"):format(
+        state.meta.source.table_,
+        table.concat(cols, ", "),
+        table.concat(table_names, ", ")
+      ))
+      return
+    end
+
+    local src = state.meta.source
+    local pk_names = {}
+    for _, c in ipairs(table_cols) do
+      if c.pk then
+        for _, k in ipairs(keep) do
+          if k.name == c.name then
+            table.insert(pk_names, c.name)
+          end
+        end
+      end
+    end
+
+    local col_names = vim.tbl_map(function(k)
+      return k.name
+    end, keep)
+    local prompt = ("Insert %d row(s) into %s.%s on %s%s?\n\n  columns: %s%s"):format(
+      #rows,
+      src.schema,
+      src.table_,
+      state.meta.conn,
+      state.meta.prod and " [PROD]" or "",
+      table.concat(col_names, ", "),
+      #dropped > 0 and ("\n  ignored (not on table): " .. table.concat(dropped, ", ")) or ""
+    )
+    local style = state.meta.prod and "Warning" or "Question"
+    if #pk_names > 0 then
+      -- pasted pk values usually collide — offer to let the db assign them
+      prompt = prompt .. "\n  primary key in payload: " .. table.concat(pk_names, ", ")
+      local choice = vim.fn.confirm(prompt, "&Insert as-is\n&Without pk\n&Cancel", 2, style)
+      if choice ~= 1 and choice ~= 2 then
+        return
+      end
+      if choice == 2 then
+        keep = vim.tbl_filter(function(k)
+          return not vim.tbl_contains(pk_names, k.name)
+        end, keep)
+        if #keep == 0 then
+          notify_err("paste: payload only contains primary key columns")
+          return
+        end
+      end
+    elseif vim.fn.confirm(prompt, "&Yes\n&No", 2, style) ~= 1 then
       return
     end
 
@@ -767,29 +826,12 @@ function M.paste()
       end
       table.insert(tuples, "(" .. table.concat(vals, ", ") .. ")")
     end
-    local src = state.meta.source
     local sql = ("INSERT INTO %s.%s (%s) VALUES %s"):format(
       quote_ident(src.schema),
       quote_ident(src.table_),
       table.concat(names, ", "),
       table.concat(tuples, ", ")
     )
-
-    local col_names = vim.tbl_map(function(k)
-      return k.name
-    end, keep)
-    local prompt = ("Insert %d row(s) into %s.%s on %s%s?\n\n  columns: %s%s"):format(
-      #rows,
-      src.schema,
-      src.table_,
-      state.meta.conn,
-      state.meta.prod and " [PROD]" or "",
-      table.concat(col_names, ", "),
-      #dropped > 0 and ("\n  ignored (not on table): " .. table.concat(dropped, ", ")) or ""
-    )
-    if vim.fn.confirm(prompt, "&Yes\n&No", 2, state.meta.prod and "Warning" or "Question") ~= 1 then
-      return
-    end
 
     rpc.request("query", { id = state.meta.conn, sql = sql, params = params }, function(err, res)
       if err then
@@ -801,6 +843,116 @@ function M.paste()
         state.meta.rerun()
       end
     end)
+  end)
+end
+
+---Open a one-line-per-column form in a float; :w runs the INSERT.
+---Empty value = column omitted (DB default / serial pk), literal NULL
+---= SQL NULL.
+function M.insert_row()
+  if not editable_or_complain() then
+    return
+  end
+  get_table_columns(function(table_cols)
+    local src = state.meta.source
+    local buf = vim.api.nvim_create_buf(false, false)
+    vim.bo[buf].buftype = "acwrite"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = "sqledit_insert"
+    vim.api.nvim_buf_set_name(buf, ("sqledit://insert/%s.%s"):format(src.schema, src.table_))
+
+    local lines = {}
+    for _, c in ipairs(table_cols) do
+      table.insert(lines, c.name .. " = ")
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modified = false
+
+    local ns = vim.api.nvim_create_namespace("sqledit_insert_form")
+    for i, c in ipairs(table_cols) do
+      local hints = { c.type }
+      if c.pk then
+        table.insert(hints, "pk")
+      end
+      if c.not_null then
+        table.insert(hints, "not null")
+      end
+      vim.api.nvim_buf_set_extmark(buf, ns, i - 1, 0, {
+        virt_text = { { "  " .. table.concat(hints, " · "), "Comment" } },
+        virt_text_pos = "eol",
+      })
+    end
+
+    local width = math.min(vim.o.columns - 4, 70)
+    local height = math.min(#lines, vim.o.lines - 6)
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      row = math.floor((vim.o.lines - height) / 2) - 1,
+      col = math.floor((vim.o.columns - width) / 2),
+      width = width,
+      height = height,
+      border = "rounded",
+      title = (" INSERT INTO %s.%s — :w runs it, empty = default, NULL = null "):format(src.schema, src.table_),
+      title_pos = "center",
+    })
+    vim.wo[win].number = false
+    vim.wo[win].signcolumn = "no"
+    vim.keymap.set("n", "q", "<cmd>bwipeout!<cr>", { buffer = buf, nowait = true })
+
+    vim.api.nvim_create_autocmd("BufWriteCmd", {
+      buffer = buf,
+      callback = function()
+        local placeholder = function(n)
+          return state.meta.adapter == "postgres" and ("$" .. n) or "?"
+        end
+        local names, vals, params = {}, {}, {}
+        for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+          local name, value = line:match("^%s*([%w_]+)%s*=%s*(.*)$")
+          if name and vim.trim(value) ~= "" then
+            value = vim.trim(value)
+            table.insert(names, quote_ident(name))
+            if value == "NULL" then
+              table.insert(params, vim.NIL)
+            else
+              table.insert(params, value)
+            end
+            table.insert(vals, placeholder(#params))
+          end
+        end
+        if #names == 0 then
+          notify_err("insert: all fields empty")
+          return
+        end
+        local sql = ("INSERT INTO %s.%s (%s) VALUES (%s)"):format(
+          quote_ident(src.schema),
+          quote_ident(src.table_),
+          table.concat(names, ", "),
+          table.concat(vals, ", ")
+        )
+        if state.meta.prod then
+          local prompt = ("Insert into %s.%s on PROD (%s)?\n\n  %s"):format(
+            src.schema, src.table_, state.meta.conn, sql)
+          if vim.fn.confirm(prompt, "&Yes\n&No", 2, "Warning") ~= 1 then
+            return
+          end
+        end
+        rpc.request("query", { id = state.meta.conn, sql = sql, params = params }, function(qerr)
+          if qerr then
+            notify_err(qerr)
+            return
+          end
+          vim.bo[buf].modified = false
+          if vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_win_close(win, true)
+          end
+          vim.notify(("sqledit: inserted 1 row into %s.%s"):format(src.schema, src.table_))
+          if state.meta.rerun then
+            state.meta.rerun()
+          end
+        end)
+      end,
+    })
   end)
 end
 

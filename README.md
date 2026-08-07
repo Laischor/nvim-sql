@@ -30,7 +30,13 @@ editing instead of a re-implementation.
   (`yj`) or a ready INSERT statement (`yi`) into register + clipboard;
   `p` in any grid parses CSV/JSON from the clipboard and inserts into
   that grid's table on the current connection (confirmed, columns
-  matched by name, extras ignored). Copy prod → switch → paste staging.
+  matched by name, extras ignored). When the payload contains primary
+  key columns, the prompt offers "Without pk" so the target database
+  assigns fresh ids. Copy prod → switch → paste staging.
+- **Insert form** — `o` in a grid opens a float with one line per
+  column (type, pk, not-null shown inline); `:w` runs the INSERT.
+  Empty field = column omitted (DB default / serial), `NULL` = SQL
+  NULL, `q` closes.
 - **Query history** — `:Sqledit history` fuzzy-picks from this
   connection's past queries (persisted across sessions) and opens the
   pick in a query buffer — it never executes directly.
@@ -147,7 +153,7 @@ identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell (visual: edit column for selected rows),
 `yc`/`yj`/`yi` yank row(s) as CSV/JSON/INSERT (visual: selection),
-`p` insert clipboard rows into this grid's table,
+`p` insert clipboard rows into this grid's table, `o` insert-row form,
 `gd` follow foreign key, `w`/`b` next/previous
 column, `gc` jump to column by name, `F` edit the last filter's
 `WHERE`/`ORDER BY`, `r` re-run query, `q` close. Column
@@ -166,8 +172,9 @@ result status.
 ## Development
 
 ```sh
-make build   # builds bin/sqledit (the Go backend)
-make test
+make build      # builds bin/sqledit (the Go backend)
+make test       # Go tests
+make test-e2e   # headless plugin suite (needs nvim + make build)
 ```
 
 Postgres integration tests run when `SQLEDIT_TEST_PG` points at a

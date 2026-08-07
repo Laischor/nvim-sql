@@ -390,6 +390,14 @@ function M.query(initial)
   if initial then
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(initial, "\n", { plain = true }))
   end
+  -- never swallow a grid/header window: hop to the previous window, or
+  -- make a new split when everything visible belongs to sqledit
+  if vim.api.nvim_buf_get_name(0):match("^sqledit://") then
+    vim.cmd("wincmd p")
+    if vim.api.nvim_buf_get_name(0):match("^sqledit://") then
+      vim.cmd("topleft split")
+    end
+  end
   vim.api.nvim_set_current_buf(buf)
   vim.keymap.set({ "n", "x" }, M.config.run_key, function()
     M.run_buffer()
