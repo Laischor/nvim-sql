@@ -161,7 +161,8 @@ Grid keys: `c` edit cell (visual: edit column for selected rows),
 column, `gc` jump to column by name, `F` edit the last filter's
 `WHERE`/`ORDER BY`, `r` re-run query, `q` close. Column
 names stay sticky in a header line above the grid — it follows
-horizontal scrolling and survives vertical scrolling. The winbar shows
+horizontal scrolling, survives vertical scrolling, and window
+navigation (`<C-w>k`/`j`) passes through it as if it weren't there. The winbar shows
 the current column (`col 4/23: created_at (timestamptz)`) plus the
 result status.
 

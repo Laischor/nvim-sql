@@ -211,6 +211,26 @@ local function ensure_windows()
     end,
     once = true,
   })
+  -- the header is display-only: entering it passes the movement through
+  -- (from the grid upwards, from anywhere else into the grid)
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = group,
+    buffer = state.header_buf,
+    callback = function()
+      if vim.api.nvim_get_current_win() ~= state.header_win then
+        return
+      end
+      local from = vim.fn.win_getid(vim.fn.winnr("#"))
+      if from == state.win then
+        vim.cmd("wincmd k")
+        if vim.api.nvim_get_current_win() == state.header_win then
+          vim.api.nvim_set_current_win(state.win) -- nothing above
+        end
+      else
+        vim.api.nvim_set_current_win(state.win)
+      end
+    end,
+  })
   vim.api.nvim_set_current_win(prev)
 end
 

@@ -386,6 +386,19 @@ end
 grid.pick_column()
 step("nav: gc picker", grid.current_column() == 3, tostring(grid.current_column()))
 
+-- header window is unfocusable: movement passes through it
+vim.api.nvim_set_current_win(gwin)
+vim.cmd("wincmd k") -- up from the grid: skip header, land above
+step("sticky: C-w k skips header upward", vim.api.nvim_get_current_win() ~= header_win, tostring(vim.api.nvim_get_current_win()))
+local above_win = vim.api.nvim_get_current_win()
+if above_win ~= gwin then
+  vim.cmd("wincmd j") -- down from above: skip header, land in the grid
+  step("sticky: C-w j skips header into grid", vim.api.nvim_get_current_win() == gwin, tostring(vim.api.nvim_get_current_win()))
+else
+  step("sticky: C-w j skips header into grid", true, "no window above grid in this layout")
+end
+vim.api.nvim_set_current_win(gwin)
+
 -- horizontal scroll sync
 vim.api.nvim_win_call(gwin, function()
   vim.cmd("normal! 5zl")
