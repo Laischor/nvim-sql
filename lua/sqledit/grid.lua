@@ -161,9 +161,23 @@ local function sync_header_scroll()
 end
 
 function M.close()
-  for _, win in ipairs({ state.win, state.header_win }) do
-    if win and vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_close(win, false)
+  -- header first, so a potential last-window fallback lands in the data
+  -- window; E444 (cannot close last window) turns into "show an empty
+  -- buffer instead"
+  for _, win in ipairs({ state.header_win, state.win }) do
+    if win and vim.api.nvim_win_is_valid(win) and not pcall(vim.api.nvim_win_close, win, false) then
+      vim.api.nvim_win_set_buf(win, vim.api.nvim_create_buf(true, false))
+      for opt, value in pairs({
+        wrap = vim.o.wrap,
+        number = vim.o.number,
+        relativenumber = vim.o.relativenumber,
+        signcolumn = vim.o.signcolumn,
+        cursorline = vim.o.cursorline,
+        winfixheight = false,
+        winbar = "",
+      }) do
+        vim.wo[win][opt] = value
+      end
     end
   end
   state.win, state.header_win = nil, nil

@@ -649,4 +649,22 @@ end)
 step("refilter: new where applied", grid_text():match("strolch") ~= nil, grid_text():sub(1, 60))
 step("refilter: prefill carries clauses", input_defaults[1] == "owner_id = 7", table.concat(input_defaults, "|"))
 
+-- q when the grid pair holds the only windows: no E444, empty buffer stays
+vim.wait(2000, function()
+  return grid_win() ~= nil
+end)
+vim.api.nvim_set_current_win(grid_win())
+for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+  local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w))
+  if not (name:match("^sqledit://results") or name:match("^sqledit://header")) then
+    pcall(vim.api.nvim_win_close, w, true)
+  end
+end
+step("close: only grid pair left", #vim.api.nvim_tabpage_list_wins(0) == 2, tostring(#vim.api.nvim_tabpage_list_wins(0)))
+local close_ok, close_err = pcall(grid.close)
+step("close: no E444 on last window", close_ok, close_err)
+local remaining = vim.api.nvim_tabpage_list_wins(0)
+local rem_buf = vim.api.nvim_win_get_buf(remaining[1])
+step("close: one empty buffer remains", #remaining == 1 and vim.api.nvim_buf_get_name(rem_buf) == "" and vim.api.nvim_buf_line_count(rem_buf) == 1, vim.api.nvim_buf_get_name(rem_buf))
+
 finish()
