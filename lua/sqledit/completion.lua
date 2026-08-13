@@ -5,6 +5,7 @@
 --   after FROM/JOIN/INTO/UPDATE/TABLE  -> tables + schemas
 --   after "<qualifier>."               -> columns (alias/table) or tables (schema)
 --   otherwise                          -> keywords + tables + schemas
+--                                         + columns of tables referenced in the buffer
 local rpc = require("sqledit.rpc")
 
 local M = {}
@@ -64,13 +65,15 @@ local STOP_WORDS = {
   values = true, returning = true, natural = true, ["and"] = true, ["or"] = true,
 }
 
----Scan the buffer for `FROM/JOIN <table> [AS] <alias>` and return
----alias(lower) -> table token (possibly "schema.table", original case).
+---Scan the buffer for `FROM/JOIN/UPDATE/INTO <table> [AS] <alias>`.
+---Returns alias(lower) -> table token (possibly "schema.table", original case)
+---and the list of distinct table tokens referenced.
 ---Quoted identifiers are not supported here.
-local function alias_map(text)
+local function scan_tables(text)
   local map = {}
+  local tables, seen = {}, {}
   local lower = text:lower()
-  for _, kw in ipairs({ "from", "join" }) do
+  for _, kw in ipairs({ "from", "join", "update", "into" }) do
     local init = 1
     while true do
       local s, e = lower:find("%f[%w]" .. kw .. "%f[%W]", init)
@@ -80,6 +83,10 @@ local function alias_map(text)
       local ts, te, pos1, _, pos2 = lower:find("^%s+()([%w_]+%.?[%w_]*)()", e + 1)
       if ts then
         local token = text:sub(pos1, pos2 - 1)
+        if not seen[token:lower()] then
+          seen[token:lower()] = true
+          table.insert(tables, token)
+        end
         local as, ae, alias = lower:find("^%s+([%w_]+)", te + 1)
         if alias == "as" then
           as, ae, alias = lower:find("^%s+([%w_]+)", ae + 1)
@@ -93,7 +100,7 @@ local function alias_map(text)
       end
     end
   end
-  return map
+  return map, tables
 end
 
 local function split_qualified(token)
@@ -120,7 +127,7 @@ local function detect(line_before_cursor, buf_text, objects)
 
   local qualifier = prefix:match("([%w_]+)%.$")
   if qualifier then
-    local aliases = alias_map(buf_text)
+    local aliases = scan_tables(buf_text)
     local target = aliases[qualifier:lower()]
     if target then
       local schema, tbl = split_qualified(target)
@@ -187,8 +194,8 @@ local function add_schemas(items, objects)
   end
 end
 
-local function column_items(cols)
-  local items = {}
+local function column_items(cols, items, src)
+  items = items or {}
   for _, c in ipairs(cols) do
     local marks = {}
     if c.pk then
@@ -200,10 +207,60 @@ local function column_items(cols)
     table.insert(items, {
       label = c.name,
       kind = KIND.Field,
-      detail = c.type .. (#marks > 0 and "  [" .. table.concat(marks, ", ") .. "]" or ""),
+      detail = (src and src .. " · " or "")
+        .. c.type
+        .. (#marks > 0 and "  [" .. table.concat(marks, ", ") .. "]" or ""),
     })
   end
   return items
+end
+
+---Resolve a table token from the buffer to a known schema+table, or nil.
+local function resolve_table(objects, token)
+  local schema, tbl = split_qualified(token)
+  if schema then
+    local ls, lt = schema:lower(), tbl:lower()
+    for _, o in ipairs(objects) do
+      if o.schema:lower() == ls and o.name:lower() == lt then
+        return o.schema, o.name
+      end
+    end
+    return nil
+  end
+  local o = find_object(objects, tbl)
+  if o then
+    return o.schema, o.name
+  end
+end
+
+---Fetch columns of every table referenced in the buffer and append them
+---to items (label detail carries the source table). Errors per table are
+---ignored — completion still returns the rest.
+local function add_referenced_columns(conn_id, buf_text, objects, items, done)
+  local _, tokens = scan_tables(buf_text)
+  local targets = {}
+  for _, token in ipairs(tokens) do
+    local schema, tbl = resolve_table(objects, token)
+    if schema then
+      table.insert(targets, { schema = schema, tbl = tbl })
+    end
+  end
+  if #targets == 0 then
+    done()
+    return
+  end
+  local pending = #targets
+  for _, t in ipairs(targets) do
+    get_columns(conn_id, t.schema, t.tbl, function(cerr, cols)
+      if not cerr then
+        column_items(cols, items, t.tbl)
+      end
+      pending = pending - 1
+      if pending == 0 then
+        done()
+      end
+    end)
+  end
 end
 
 ---@param opts {conn_id: string, line_before_cursor: string, buf_text: string}
@@ -234,11 +291,15 @@ function M.complete(opts, cb)
         add_schemas(items, objects)
       end
     elseif ctx.kind == "general" then
-      for _, kw in ipairs(KEYWORDS) do
-        table.insert(items, { label = kw, kind = KIND.Keyword })
-      end
-      add_tables(items, objects, nil)
-      add_schemas(items, objects)
+      add_referenced_columns(opts.conn_id, opts.buf_text, objects, items, function()
+        for _, kw in ipairs(KEYWORDS) do
+          table.insert(items, { label = kw, kind = KIND.Keyword })
+        end
+        add_tables(items, objects, nil)
+        add_schemas(items, objects)
+        cb(nil, items)
+      end)
+      return
     end
     cb(nil, items)
   end)
