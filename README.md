@@ -186,3 +186,7 @@ scratch database (`postgres://user:pass@localhost:5432/db`); they are
 skipped otherwise.
 
 Protocol between Lua and Go: [docs/protocol.md](docs/protocol.md).
+
+## License
+
+[MIT](LICENSE) © Laischor
