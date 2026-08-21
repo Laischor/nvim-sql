@@ -989,11 +989,11 @@ function M.paste()
   end)
 end
 
----Delete the selected rows (or the cursor row) — always confirmed.
 ---Yank the visually selected cell block (rows × columns). Meant for
 ---copying data between tables: paste it onto a block in another grid
----(visual `p`) as per-row UPDATEs. Also puts a TSV copy into the
----unnamed register. Works in any grid, joins included.
+---(visual `p`) as per-row UPDATEs. A TSV copy goes into the unnamed
+---register and the system clipboard, so the block also pastes as text
+---into any buffer. Works in any grid, joins included.
 function M.yank_cells()
   if not (state.result and #(state.result.rows or {}) > 0) then
     return
@@ -1023,7 +1023,9 @@ function M.yank_cells()
     rows = values,
     from = ("%s on %s"):format(src and (src.schema and src.schema .. "." .. src.table_ or src.table_) or "a query", state.meta.conn),
   }
-  vim.fn.setreg('"', table.concat(text, "\n"))
+  local tsv = table.concat(text, "\n")
+  vim.fn.setreg('"', tsv)
+  pcall(vim.fn.setreg, "+", tsv)
   vim.notify(("sqledit: yanked %d×%d cell block (visual p in a grid pastes it as UPDATEs)"):format(#rows, #cols))
 end
 
@@ -1141,6 +1143,7 @@ function M.paste_cells()
   end)
 end
 
+---Delete the selected rows (or the cursor row) — always confirmed.
 function M.delete_rows()
   if not editable_or_complain() then
     return
