@@ -13,6 +13,7 @@ local config_file = tmp .. "/connections.toml"
 do
   local f = assert(io.open(config_file, "w"))
   f:write(('[[servers]]\nname = "testdb"\nadapter = "sqlite"\npath = "%s/test.db"\n'):format(tmp))
+  f:write(('[[servers]]\nname = "otherdb"\nadapter = "sqlite"\npath = "%s/other.db"\n'):format(tmp))
   f:close()
 end
 
@@ -658,6 +659,151 @@ vim.wait(3000, function()
 end)
 step("refilter: new where applied", grid_text():match("strolch") ~= nil, grid_text():sub(1, 60))
 step("refilter: prefill carries clauses", input_defaults[1] == "owner_id = 7", table.concat(input_defaults, "|"))
+
+-- ------------------------------------------------- per-buffer connections
+-- a query buffer is born bound to the connection in effect; the name shows it
+sqledit.query()
+local qbuf = vim.api.nvim_get_current_buf()
+step("bind: query buffer bound", vim.b[qbuf].sqledit_conn.id == "testdb/main", vim.inspect(vim.b[qbuf].sqledit_conn))
+step(
+  "bind: name carries connection",
+  vim.api.nvim_buf_get_name(qbuf):match("sqledit://query%-%d+@testdb/main$") ~= nil,
+  vim.api.nvim_buf_get_name(qbuf)
+)
+
+-- switching inside a query buffer rebinds it (and renames)
+vim.ui.select = function(items, _, on_choice)
+  for i, it in ipairs(items) do
+    if it.server and it.server.name == "otherdb" then
+      on_choice(it, i)
+      return
+    end
+  end
+end
+sqledit.connect()
+vim.wait(3000, function()
+  return sqledit.status() == "otherdb/main"
+end)
+step("bind: switch rebinds current query buffer", vim.b[qbuf].sqledit_conn.id == "otherdb/main", vim.inspect(vim.b[qbuf].sqledit_conn))
+step("bind: rename on rebind", vim.api.nvim_buf_get_name(qbuf):match("@otherdb/main$") ~= nil, vim.api.nvim_buf_get_name(qbuf))
+
+-- open connections come first in the picker; picking one skips the db prompt
+local seen_items
+local select_calls = 0
+vim.ui.select = function(items, _, on_choice)
+  select_calls = select_calls + 1
+  seen_items = items
+  for i, it in ipairs(items) do
+    if it.conn and it.conn.id == "testdb/main" then
+      on_choice(it, i)
+      return
+    end
+  end
+end
+vim.cmd("new") -- plain buffer: only the global default moves
+sqledit.connect()
+vim.wait(3000, function()
+  return sqledit.status() == "testdb/main"
+end)
+step("fast: open connections listed first", seen_items[1].conn ~= nil and seen_items[2].conn ~= nil, vim.inspect(seen_items[1]))
+step("fast: single picker, no db prompt", select_calls == 1, tostring(select_calls))
+step("fast: global switched", sqledit.status() == "testdb/main", sqledit.status())
+
+-- the bound buffer keeps its connection and runs against it
+step("bind: survives global switch", vim.b[qbuf].sqledit_conn.id == "otherdb/main", vim.inspect(vim.b[qbuf].sqledit_conn))
+vim.api.nvim_set_current_buf(qbuf)
+step("bind: statusline is buffer-aware", sqledit.status() == "otherdb/main", sqledit.status())
+vim.api.nvim_buf_set_lines(qbuf, 0, -1, false, { "SELECT 42" })
+sqledit.run_buffer()
+local oentries
+vim.wait(3000, function()
+  oentries = history.get("otherdb/main")
+  return #oentries > 0
+end)
+step("bind: run uses buffer connection", oentries[1] and oentries[1].sql == "SELECT 42", oentries[1] and oentries[1].sql)
+
+-- disconnect clears matching bindings and restores the plain name
+vim.api.nvim_set_current_buf(qbuf)
+sqledit.disconnect()
+drain(500)
+step("bind: disconnect unbinds buffer", vim.b[qbuf].sqledit_conn == nil, vim.inspect(vim.b[qbuf].sqledit_conn))
+step(
+  "bind: name restored on unbind",
+  vim.api.nvim_buf_get_name(qbuf):match("sqledit://query%-%d+$") ~= nil,
+  vim.api.nvim_buf_get_name(qbuf)
+)
+step("bind: global default untouched", sqledit.status() == "testdb/main", sqledit.status())
+
+-- ------------------------------------------------------------------- tree
+local tree = require("sqledit.tree")
+local function tree_lines()
+  return vim.api.nvim_buf_get_lines(tree.state().buf, 0, -1, false)
+end
+local function tree_line(pat)
+  for i, l in ipairs(tree_lines()) do
+    if l:match(pat) then
+      return i, l
+    end
+  end
+end
+
+sqledit.tree()
+vim.wait(3000, function()
+  return #tree.state().nodes == 2
+end)
+local twin = vim.api.nvim_get_current_win()
+step("tree: opens with both servers", #tree.state().nodes == 2, tostring(#tree.state().nodes))
+step("tree: buffer name", vim.api.nvim_buf_get_name(0) == "sqledit://tree", vim.api.nvim_buf_get_name(0))
+step("tree: server label has adapter", tree_line("testdb%s+%(sqlite%)") ~= nil, tree_lines()[1])
+
+-- drill into the sqlite server: database level and lone schema are skipped,
+-- tables hang directly under the server
+vim.api.nvim_win_set_cursor(twin, { tree_line("testdb"), 0 })
+tree.drill()
+vim.wait(3000, function()
+  return tree_line("dogs") ~= nil
+end)
+step("tree: tables under sqlite server", tree_line("pets") ~= nil and tree_line("dogs") ~= nil, vim.inspect(tree_lines()))
+local _, dogs_line = tree_line("▸ dogs")
+step("tree: no schema level for lone schema", dogs_line ~= nil and dogs_line:match("^  ▸") ~= nil, dogs_line)
+
+-- drill into a table: columns with pk/fk markers
+vim.api.nvim_win_set_cursor(twin, { tree_line("▸ dogs"), 0 })
+tree.drill()
+vim.wait(3000, function()
+  return tree_line("owner_id") ~= nil
+end)
+local _, pk_line = tree_line("^%s+id%s")
+local _, fk_line = tree_line("owner_id")
+step("tree: pk marker", pk_line ~= nil and pk_line:match("%[pk%]") ~= nil, pk_line)
+step("tree: fk marker", fk_line ~= nil and fk_line:match("%[fk%]") ~= nil, fk_line)
+
+-- l on an expanded node steps into the first child
+vim.api.nvim_win_set_cursor(twin, { tree_line("▾ dogs"), 0 })
+tree.drill()
+step("tree: drill steps into child", vim.api.nvim_win_get_cursor(twin)[1] == tree_line("▾ dogs") + 1, tostring(vim.api.nvim_win_get_cursor(twin)[1]))
+
+-- h climbs to the parent, h again collapses it
+tree.climb()
+step("tree: climb to parent", vim.api.nvim_win_get_cursor(twin)[1] == tree_line("▾ dogs"), tostring(vim.api.nvim_win_get_cursor(twin)[1]))
+tree.climb()
+step("tree: climb collapses", tree_line("owner_id") == nil, vim.inspect(tree_lines()))
+
+-- <CR> on a table opens its data in the grid; the cursor stays in the tree
+vim.api.nvim_win_set_cursor(twin, { tree_line("▸ pets$") or tree_line("▸ pets"), 0 })
+tree.activate()
+vim.wait(3000, function()
+  return grid_text():match("rex") ~= nil
+end)
+step("tree: enter opens table data", grid_text():match("rex") ~= nil, grid_text():sub(1, 60))
+step("tree: cursor stays in tree", vim.api.nvim_get_current_win() == twin, tostring(vim.api.nvim_get_current_win()))
+
+-- toggle closes, reopening keeps the expansion state
+sqledit.tree()
+step("tree: toggle closes", not vim.api.nvim_win_is_valid(twin))
+sqledit.tree()
+step("tree: expansion survives reopen", tree_line("▾ testdb") ~= nil and tree_line("dogs") ~= nil, vim.inspect(tree_lines()))
+tree.close()
 
 -- q when the grid pair holds the only windows: no E444, empty buffer stays
 vim.wait(2000, function()

@@ -19,6 +19,11 @@ Errors: `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"..."}}`
 ### `connections.list` → `{config_path, servers: [{name, adapter, host?, port?, user?, database?, path?, prod, readonly}]}`
 Configured servers from `connections.toml`. Never includes secrets.
 
+### `connections.active` → `{connections: [connInfo]}`
+Currently open connections, sorted by `id`. The frontend lists these at the
+top of the connect picker so switching to an open connection skips the
+server/database prompts.
+
 ### `databases.list {server}` → `{databases: [string]}`
 Live list from `pg_database` — ad-hoc database copies show up without config
 changes. sqlite always returns `["main"]`.

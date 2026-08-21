@@ -27,6 +27,50 @@ local function notify_err(msg)
   vim.notify("sqledit: " .. msg, vim.log.levels.ERROR)
 end
 
+local function is_query_buf(buf)
+  return vim.api.nvim_buf_get_name(buf):match("^sqledit://query%-") ~= nil
+end
+
+---Bind a query buffer to a connection (nil unbinds) and reflect it in the
+---buffer name: sqledit://query-3@site3/analytics.
+local function bind_buffer(buf, info)
+  vim.b[buf].sqledit_conn = info
+  local old = vim.api.nvim_buf_get_name(buf)
+  local n = old:match("^sqledit://query%-(%d+)")
+  if not n then
+    return
+  end
+  local new = info and ("sqledit://query-%s@%s"):format(n, info.id) or ("sqledit://query-%s"):format(n)
+  if new == old then
+    return
+  end
+  vim.api.nvim_buf_set_name(buf, new)
+  -- renaming leaves an unlisted buffer holding the old name — wipe it
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if b ~= buf and vim.api.nvim_buf_get_name(b) == old then
+      vim.api.nvim_buf_delete(b, { force = true })
+    end
+  end
+end
+
+---Connection a buffer runs against: its own binding, else the global one.
+local function effective_conn(buf)
+  return vim.b[buf].sqledit_conn or state.current
+end
+
+---Make `info` the connection to use from here on: global default, plus the
+---current query buffer's binding when we're in one.
+local function adopt_conn(info, on_done)
+  state.current = info
+  if is_query_buf(0) then
+    bind_buffer(vim.api.nvim_get_current_buf(), info)
+  end
+  vim.notify("sqledit: connected to " .. info.id .. (info.prod and " [PROD]" or ""))
+  if on_done then
+    on_done(info)
+  end
+end
+
 local function plugin_root()
   local src = debug.getinfo(1, "S").source:sub(2)
   return vim.fs.normalize(vim.fs.dirname(src) .. "/../..")
@@ -82,10 +126,11 @@ function M.blink_registered()
   return blink_registered
 end
 
----Current connection info ({id, server, database, adapter, prod, readonly})
----or nil. Used by completion sources.
+---Connection info ({id, server, database, adapter, prod, readonly}) the
+---current buffer runs against — its binding, else the global one — or nil.
+---Used by completion sources.
 function M.current()
-  return state.current
+  return effective_conn(0)
 end
 
 ---Drop cached schema data so completion re-introspects (e.g. after DDL).
@@ -94,9 +139,10 @@ function M.refresh()
   vim.notify("sqledit: schema cache cleared")
 end
 
----Current connection label for the statusline, e.g. "site3/analytics [PROD]".
+---Connection label for the statusline, e.g. "site3/analytics [PROD]".
+---Buffer-aware: a bound query buffer shows its own connection.
 function M.status()
-  local c = state.current
+  local c = effective_conn(0)
   if not c then
     return ""
   end
@@ -147,12 +193,13 @@ local function detect_source(sql)
   return { schema = schema, table_ = tbl }
 end
 
----Run SQL on the current connection and show the result grid.
-function M.run(sql)
+---Run SQL and show the result grid. `conn` pins the connection; without it
+---the current buffer's binding is used, falling back to the global one.
+function M.run(sql, conn)
   if not ensure_backend() then
     return
   end
-  local c = state.current
+  local c = conn or effective_conn(0)
   if not c then
     notify_err("no connection — :Sqledit connect first")
     return
@@ -182,7 +229,7 @@ function M.run(sql)
       sql = sql,
       source = detect_source(sql),
       rerun = function()
-        M.run(sql)
+        M.run(sql, c)
       end,
     })
   end)
@@ -194,11 +241,7 @@ local function connect_to(server_name, database, on_done)
       notify_err(err)
       return
     end
-    state.current = info
-    vim.notify("sqledit: connected to " .. info.id .. (info.prod and " [PROD]" or ""))
-    if on_done then
-      on_done(info)
-    end
+    adopt_conn(info, on_done)
   end)
 end
 
@@ -225,39 +268,78 @@ local function pick_database(server, on_done)
   end)
 end
 
----Pick server, then database, then connect. `on_done(info)` is optional.
+---Pick a connection. Already-open connections come first and are adopted
+---directly (no database picker); configured servers follow and go through
+---the server → database flow. `on_done(info)` is optional.
 function M.connect(on_done)
   if not ensure_backend() then
     return
   end
-  rpc.request("connections.list", nil, function(err, res)
-    if err then
-      notify_err(err)
-      return
-    end
-    local servers = res.servers or {}
-    if #servers == 0 then
-      notify_err("no servers configured — edit " .. (res.config_path or "connections.toml"))
-      return
-    end
-    vim.ui.select(servers, {
-      prompt = "SQL server",
-      format_item = function(s)
-        local tags = {}
-        if s.prod then
-          table.insert(tags, "PROD")
-        end
-        if s.readonly then
-          table.insert(tags, "ro")
-        end
-        return ("%s  (%s%s)"):format(s.name, s.adapter, #tags > 0 and ", " .. table.concat(tags, ", ") or "")
-      end,
-    }, function(server)
-      if server then
-        pick_database(server, on_done)
+  rpc.request("connections.active", nil, function(aerr, ares)
+    local active = (not aerr and ares.connections) or {}
+    rpc.request("connections.list", nil, function(err, res)
+      if err then
+        notify_err(err)
+        return
       end
+      local servers = res.servers or {}
+      if #servers == 0 and #active == 0 then
+        notify_err("no servers configured — edit " .. (res.config_path or "connections.toml"))
+        return
+      end
+      local items = {}
+      for _, c in ipairs(active) do
+        table.insert(items, { conn = c })
+      end
+      for _, s in ipairs(servers) do
+        table.insert(items, { server = s })
+      end
+      vim.ui.select(items, {
+        prompt = "SQL server",
+        format_item = function(it)
+          local tags = {}
+          if it.conn then
+            table.insert(tags, "open")
+          end
+          local s = it.conn or it.server
+          if s.prod then
+            table.insert(tags, "PROD")
+          end
+          if s.readonly then
+            table.insert(tags, "ro")
+          end
+          if it.conn then
+            return ("%s  (%s)"):format(it.conn.id, table.concat(tags, ", "))
+          end
+          return ("%s  (%s%s)"):format(s.name, s.adapter, #tags > 0 and ", " .. table.concat(tags, ", ") or "")
+        end,
+      }, function(it)
+        if not it then
+          return
+        end
+        if it.conn then
+          adopt_conn(it.conn, on_done)
+        else
+          pick_database(it.server, on_done)
+        end
+      end)
     end)
   end)
+end
+
+---Adopt an already-open connection (a connInfo) as the one to use from
+---here on — global default plus the current query buffer's binding. Used
+---by the tree view.
+function M.use_connection(info)
+  adopt_conn(info)
+end
+
+---Toggle the tree sidebar (servers → databases → schemas → tables → columns).
+function M.tree()
+  if not ensure_backend() then
+    return
+  end
+  require("sqledit.tree").toggle()
 end
 
 ---Switch connection, then offer to re-run the last query there — same
@@ -318,7 +400,7 @@ function M.tables(opts)
   if not ensure_backend() then
     return
   end
-  local c = state.current
+  local c = effective_conn(0)
   if not c then
     -- no connection yet: connect first, then re-open the picker
     M.connect(function()
@@ -347,12 +429,12 @@ function M.tables(opts)
       end
       local base = ("SELECT * FROM %s.%s"):format(quote_ident(obj.schema), quote_ident(obj.name))
       if not opts.clauses then
-        M.run(("%s LIMIT %d"):format(base, M.config.max_rows))
+        M.run(("%s LIMIT %d"):format(base, M.config.max_rows), c)
         return
       end
       input_clauses({}, function(suffix, where, order)
-        state.last_filter = { base = base, where = where, order = order }
-        M.run(("%s%s LIMIT %d"):format(base, suffix, M.config.max_rows))
+        state.last_filter = { base = base, where = where, order = order, conn = c }
+        M.run(("%s%s LIMIT %d"):format(base, suffix, M.config.max_rows), c)
       end)
     end)
   end)
@@ -372,17 +454,22 @@ function M.refilter()
     return
   end
   input_clauses({ where = f.where, order = f.order }, function(suffix, where, order)
-    state.last_filter = { base = f.base, where = where, order = order }
-    M.run(("%s%s LIMIT %d"):format(f.base, suffix, M.config.max_rows))
+    state.last_filter = { base = f.base, where = where, order = order, conn = f.conn }
+    M.run(("%s%s LIMIT %d"):format(f.base, suffix, M.config.max_rows), f.conn)
   end)
 end
 
----Open a scratch SQL buffer bound to the current connection,
----optionally prefilled.
+---Open a scratch SQL buffer, optionally prefilled. The buffer is bound to
+---the connection in effect here (a bound buffer passes its binding on);
+---the binding shows in the buffer name and survives later switches.
 function M.query(initial)
   state.query_count = state.query_count + 1
+  local conn = effective_conn(0)
   local buf = vim.api.nvim_create_buf(true, true)
   vim.api.nvim_buf_set_name(buf, ("sqledit://query-%d"):format(state.query_count))
+  if conn then
+    bind_buffer(buf, conn)
+  end
   vim.bo[buf].filetype = "sql"
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
@@ -407,7 +494,7 @@ end
 ---Pick a query from this connection's history; opens it in a query
 ---buffer (never runs it directly).
 function M.history()
-  local c = state.current
+  local c = effective_conn(0)
   if not c then
     notify_err("no connection — :Sqledit connect first")
     return
@@ -454,13 +541,23 @@ function M.run_range(line1, line2)
   M.run(table.concat(lines, "\n"))
 end
 
+---Disconnect the connection in effect for the current buffer. Clears the
+---global default when it matches and unbinds every buffer bound to it.
 function M.disconnect()
-  local c = state.current
+  local c = effective_conn(0)
   if not c then
     return
   end
   rpc.request("disconnect", { id = c.id }, function() end)
-  state.current = nil
+  if state.current and state.current.id == c.id then
+    state.current = nil
+  end
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local bc = vim.b[buf].sqledit_conn
+    if bc and bc.id == c.id then
+      bind_buffer(buf, nil)
+    end
+  end
   vim.notify("sqledit: disconnected from " .. c.id)
 end
 

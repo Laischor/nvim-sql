@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	"github.com/Laischor/nvim-sql/internal/config"
@@ -126,6 +127,16 @@ func (s *Server) dispatch(req *request) (any, error) {
 			"config_path": s.cfg.FilePath,
 			"servers":     s.cfg.Servers,
 		}, nil
+
+	case "connections.active":
+		s.connMu.Lock()
+		infos := make([]connInfo, 0, len(s.infos))
+		for _, info := range s.infos {
+			infos = append(infos, info)
+		}
+		s.connMu.Unlock()
+		sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+		return map[string]any{"connections": infos}, nil
 
 	case "databases.list":
 		var p struct {

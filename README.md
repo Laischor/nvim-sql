@@ -9,8 +9,15 @@ editing instead of a re-implementation.
   No tree drilling.
 - **Cheap connection switching** — `:Sqledit switch` changes connection and
   offers to re-run your last query there (confirm with preview; write
-  statements are never offered). Databases are listed live from the server,
-  so ad-hoc copies appear without config changes.
+  statements are never offered). Already-open connections sit at the top of
+  the picker and connect instantly, skipping the database prompt. Databases
+  are listed live from the server, so ad-hoc copies appear without config
+  changes.
+- **Per-buffer connections** — every query buffer is pinned to the
+  connection it was opened under and shows it in its name
+  (`sqledit://query-3@site3/analytics`). Switching while inside a query
+  buffer re-pins that buffer; other buffers keep running against their own
+  connection. Completion and the statusline follow the buffer's pin.
 - **Real vim** — queries live in normal `sql` buffers: your keymaps, your
   LSP, your treesitter.
 - **Schema-aware completion** — blink.cmp source fed from live
@@ -39,6 +46,12 @@ editing instead of a re-implementation.
   column (type, pk, not-null shown inline); `:w` runs the INSERT.
   Empty field = column omitted (DB default / serial), `NULL` = SQL
   NULL, `q` closes.
+- **Tree view** — `:Sqledit tree` toggles a sidebar for secondary
+  browsing: servers → databases → schemas → tables → columns (pk/nn/fk
+  marked). `l`/`h` drill and climb, `<CR>` on a table opens its data in
+  the grid while the cursor stays in the tree, `c` adopts a node's
+  connection, `R` refetches a subtree. Children load lazily and are
+  cached; lone schemas are skipped. Prod servers keep their warning tag.
 - **Query history** — `:Sqledit history` fuzzy-picks from this
   connection's past queries (persisted across sessions) and opens the
   pick in a query buffer — it never executes directly.
@@ -119,18 +132,20 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 
 | Command | |
 |---|---|
-| `:Sqledit connect` | pick server → database → connect |
+| `:Sqledit connect` | pick a connection: open ones first (instant), else server → database |
 | `:Sqledit switch` | reconnect elsewhere, offer re-run of last query (confirmed, reads only) |
+| `:Sqledit tree` | toggle the tree sidebar (`l`/`h` drill/climb, `<CR>` open table, `c` use connection, `R` refetch, `q` close) |
 | `:Sqledit tables` | fuzzy-pick a table/view → `SELECT * … LIMIT n` |
 | `:Sqledit filter` | like `tables`, plus prompts for `WHERE` / `ORDER BY` |
 | `:Sqledit refilter` | re-edit the last filter's clauses (prefilled), re-run |
-| `:Sqledit query` | open a scratch SQL buffer (run: `<localleader>r`) |
+| `:Sqledit query` | open a scratch SQL buffer pinned to the connection (run: `<localleader>r`) |
 | `:Sqledit run [sql]` | run argument, visual range, or current buffer |
 | `:Sqledit history` | pick a past query → opens in a query buffer |
 | `:Sqledit refresh` | clear schema cache (completion re-introspects) |
-| `:Sqledit disconnect` | drop current connection |
+| `:Sqledit disconnect` | drop the buffer's connection (unpins its buffers) |
 
-Statusline: `require("sqledit").status()` → `"site3-prod/app [PROD]"`.
+Statusline: `require("sqledit").status()` → `"site3-prod/app [PROD]"`
+(buffer-aware: pinned query buffers show their own connection).
 
 ### Completion (blink.cmp)
 
@@ -170,7 +185,6 @@ result status.
 
 ## Roadmap
 
-- tree view as secondary browsing
 - multi-statement support for postgres (single statement per run for now)
 
 ## Development

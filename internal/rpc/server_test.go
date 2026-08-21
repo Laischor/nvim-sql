@@ -107,10 +107,21 @@ func TestSQLiteEndToEnd(t *testing.T) {
 		t.Fatalf("ping: %v", res)
 	}
 
+	res = c.call(t, "connections.active", nil)
+	if n := len(res["connections"].([]any)); n != 0 {
+		t.Fatalf("connections.active before connect: %d entries", n)
+	}
+
 	res = c.call(t, "connect", map[string]any{"server": "testdb"})
 	connID, _ := res["id"].(string)
 	if connID != "testdb/main" {
 		t.Fatalf("connect: got id %q", connID)
+	}
+
+	res = c.call(t, "connections.active", nil)
+	active := res["connections"].([]any)
+	if len(active) != 1 || active[0].(map[string]any)["id"] != connID {
+		t.Fatalf("connections.active: %v", active)
 	}
 
 	c.call(t, "query", map[string]any{"id": connID,
@@ -224,6 +235,11 @@ func TestSQLiteEndToEnd(t *testing.T) {
 
 	c.call(t, "disconnect", map[string]any{"id": connID})
 	c.callErr(t, "query", map[string]any{"id": connID, "sql": "SELECT 1"})
+
+	res = c.call(t, "connections.active", nil)
+	if n := len(res["connections"].([]any)); n != 0 {
+		t.Fatalf("connections.active after disconnect: %d entries", n)
+	}
 }
 
 func TestConnectionsListEmptyConfig(t *testing.T) {
