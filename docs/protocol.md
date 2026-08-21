@@ -48,6 +48,11 @@ maintenance database (postgres) or `main` (sqlite). The returned `id`
   stringified, json/array columns keep their structure.
 - Statements without a result set return empty `columns` and `rows_affected`.
 
+### `batch {id, statements: [{sql, params}]}` → `{rows_affected: [int]}`
+Runs the statements in one transaction; any failure rolls everything
+back. Same text-or-null param rule as `query`. Used by the grid's cell
+block paste (one UPDATE per row).
+
 ### `objects {id}` → `{objects: [{schema, name, type}]}`
 Tables, views, matviews. `type` ∈ `table | view | matview | foreign`.
 

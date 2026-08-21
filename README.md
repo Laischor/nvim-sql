@@ -31,8 +31,10 @@ editing instead of a re-implementation.
   plain single-table SELECTs with the primary key in the result;
   everything else stays read-only. Input semantics: `NULL` = SQL NULL,
   `''` = empty string, empty input = no change (NULL cells prefill
-  empty). `dd` / visual `d` deletes rows — always behind a confirm.
-  `r` re-runs the query.
+  empty), `=column` copies another column's value row by row (server-side
+  `SET a = b` — each row gets its own value; the way to move data from
+  one column into another). `dd` / visual `d` deletes rows — always
+  behind a confirm. `r` re-runs the query.
 - **FK jump** — `gd` on a foreign-key cell opens the referenced row.
   Works recursively: the target grid is a normal grid.
 - **Copy & paste between servers** — yank rows as CSV (`yc`), JSON
@@ -42,10 +44,20 @@ editing instead of a re-implementation.
   matched by name, extras ignored). When the payload contains primary
   key columns, the prompt offers "Without pk" so the target database
   assigns fresh ids. Copy prod → switch → paste staging.
-- **Insert form** — `o` in a grid opens a float with one line per
-  column (type, pk, not-null shown inline); `:w` runs the INSERT.
-  Empty field = column omitted (DB default / serial), `NULL` = SQL
-  NULL, `q` closes.
+- **Cell block copy between tables** — select cells with `<C-v>` and
+  `y` to yank the block (works in any grid, joins included; a TSV copy
+  lands in the register too). In the target grid, select a same-shaped
+  block and `p`: one UPDATE per row, all in a single transaction
+  (all-or-nothing), rows and columns matched by position. The way to
+  move a column's values from one table into another when cleaning up
+  data.
+- **Insert form** — `o` in a grid opens a float with one field per
+  column: aligned virtual labels (pk highlighted, can't be mangled),
+  type/pk/not-null hints pinned right, ghost `default` on empty fields.
+  `<Tab>`/`<S-Tab>` (and `<CR>` while typing) hop between fields, the
+  cursor starts on the first non-pk column. `<CR>` or `:w` runs the
+  INSERT. Empty field = column omitted (DB default / serial), `NULL` =
+  SQL NULL, `''` = empty string, `q` closes.
 - **Tree view** — `:Sqledit tree` toggles a sidebar for secondary
   browsing: servers → databases → schemas → tables → columns (pk/nn/fk
   marked). `l`/`h` drill and climb, `<CR>` on a table opens its data in

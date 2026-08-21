@@ -228,6 +228,33 @@ func TestSQLiteEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected fks: %v", fkByName)
 	}
 
+	// batch: per-statement rows_affected, all-or-nothing transaction
+	res = c.call(t, "batch", map[string]any{"id": connID, "statements": []any{
+		map[string]any{"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{"40", "alice"}},
+		map[string]any{"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{"41", "bob"}},
+	}})
+	counts := res["rows_affected"].([]any)
+	if len(counts) != 2 || counts[0].(float64) != 1 || counts[1].(float64) != 1 {
+		t.Fatalf("batch: rows_affected = %v", counts)
+	}
+	res = c.call(t, "query", map[string]any{"id": connID, "sql": "SELECT age FROM users WHERE name = 'bob'"})
+	if res["rows"].([]any)[0].([]any)[0].(float64) != 41 {
+		t.Fatalf("batch not applied: %v", res["rows"])
+	}
+	// second statement fails -> first must be rolled back
+	c.callErr(t, "batch", map[string]any{"id": connID, "statements": []any{
+		map[string]any{"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{"99", "alice"}},
+		map[string]any{"sql": "UPDATE nope SET x = 1"},
+	}})
+	res = c.call(t, "query", map[string]any{"id": connID, "sql": "SELECT age FROM users WHERE name = 'alice'"})
+	if res["rows"].([]any)[0].([]any)[0].(float64) != 40 {
+		t.Fatalf("batch rollback failed: %v", res["rows"])
+	}
+	// non-string params rejected
+	c.callErr(t, "batch", map[string]any{"id": connID, "statements": []any{
+		map[string]any{"sql": "SELECT ?", "params": []any{42}},
+	}})
+
 	// bad SQL surfaces as rpc error, not a dead server
 	c.callErr(t, "query", map[string]any{"id": connID, "sql": "SELEC nope"})
 	// unknown connection

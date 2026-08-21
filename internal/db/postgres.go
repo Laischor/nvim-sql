@@ -142,6 +142,26 @@ func (c *PGConn) Query(ctx context.Context, sqlText string, params []any, maxRow
 	return res, nil
 }
 
+func (c *PGConn) Batch(ctx context.Context, stmts []Statement) ([]int64, error) {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	affected := make([]int64, len(stmts))
+	for i, st := range stmts {
+		tag, err := tx.Exec(ctx, st.SQL, st.Params...)
+		if err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i+1, err)
+		}
+		affected[i] = tag.RowsAffected()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return affected, nil
+}
+
 func (c *PGConn) Objects(ctx context.Context) ([]Object, error) {
 	rows, err := c.pool.Query(ctx, `
 		SELECT n.nspname, c.relname,

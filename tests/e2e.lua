@@ -451,6 +451,61 @@ grid.edit_cells()
 drain(300)
 step("multiedit: common value prefilled", input_default == "same", input_default)
 
+-- --------------------------------------------------------------- column copy
+-- "=column" copies another column's value row by row (SET a = b)
+query_sync("UPDATE pets SET name = 'cn1', weight = 1.5 WHERE id = 1")
+query_sync("UPDATE pets SET name = 'cn2', weight = 2.5 WHERE id = 2")
+sqledit.run("SELECT id, name, weight FROM pets ORDER BY id")
+wait_grid("cn1")
+vim.api.nvim_set_current_win(gwin)
+line1 = grid_lines()[1]
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("cn1") - 1 })
+vim.cmd("normal! Vj")
+confirm_prompts = {}
+next_input = "=weight"
+grid.edit_cells()
+vim.wait(5000, function()
+  local e, r = query_sync("SELECT name FROM pets ORDER BY id")
+  return r and r.rows[1][1] == "1.5" and r.rows[2][1] == "2.5"
+end)
+qerr, qres = query_sync("SELECT name FROM pets ORDER BY id")
+step(
+  "colcopy: per-row values in db",
+  qres and qres.rows[1][1] == "1.5" and qres.rows[2][1] == "2.5",
+  vim.inspect(qres and qres.rows)
+)
+step("colcopy: confirm names the copy", confirm_prompts[1] ~= nil and confirm_prompts[1]:match("column copy") ~= nil, confirm_prompts[1])
+step("colcopy: grid mirrors locally", grid_lines()[1]:match("1%.5.*1%.5") ~= nil, grid_lines()[1])
+
+-- unknown source column refused
+capture_notify()
+vim.api.nvim_win_set_cursor(gwin, { 1, 0 })
+vim.cmd("normal! Vj")
+next_input = "=nosuch"
+grid.edit_cells()
+vim.wait(3000, function()
+  return last_err():match("no column") ~= nil
+end)
+step("colcopy: unknown source refused", last_err():match('no column "nosuch"') ~= nil, last_err())
+vim.notify = orig_notify
+
+-- source column not in the result: update persists, grid refetches
+query_sync("UPDATE pets SET name = 'zz' WHERE id IN (1, 2)")
+sqledit.run("SELECT id, name FROM pets ORDER BY id")
+wait_grid("zz")
+vim.api.nvim_set_current_win(gwin)
+line1 = grid_lines()[1]
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("zz") - 1 })
+vim.cmd("normal! Vj")
+next_input = "=weight"
+grid.edit_cells()
+vim.wait(5000, function()
+  return grid_text():match("1%.5") ~= nil
+end)
+step("colcopy: source outside result reruns", grid_text():match("1%.5") ~= nil, grid_text():sub(1, 60))
+qerr, qres = query_sync("SELECT name FROM pets WHERE id = 1")
+step("colcopy: persisted without source in result", qres and qres.rows[1][1] == "1.5", vim.inspect(qres and qres.rows))
+
 -- -------------------------------------------------------------- yank/paste
 query_sync("UPDATE pets SET name = 'rex', weight = 12.5 WHERE id = 1")
 query_sync("UPDATE pets SET name = 'mi,a', weight = NULL WHERE id = 2")
@@ -563,8 +618,24 @@ vim.wait(3000, function()
   return form_buf ~= nil
 end)
 step("form: opens with one line per column", form_buf ~= nil and vim.api.nvim_buf_line_count(form_buf) == 3)
-step("form: field lines", form_buf ~= nil and vim.api.nvim_buf_get_lines(form_buf, 0, 1, false)[1]:match("^id = ") ~= nil)
-vim.api.nvim_buf_set_lines(form_buf, 0, -1, false, { "id = ", "name = formy", "weight = NULL" })
+-- lines hold only values; column labels are virtual text (can't be mangled)
+local form_marks = vim.api.nvim_buf_get_extmarks(
+  form_buf,
+  vim.api.nvim_create_namespace("sqledit_insert_form"),
+  0,
+  -1,
+  { details = true }
+)
+local label_texts = {}
+for _, m in ipairs(form_marks) do
+  local vt = m[4].virt_text
+  if vt and m[4].virt_text_pos == "inline" then
+    table.insert(label_texts, vim.trim(vt[1][1]))
+  end
+end
+step("form: virtual labels", vim.deep_equal(label_texts, { "id", "name", "weight" }), vim.inspect(label_texts))
+step("form: cursor on first non-pk field", vim.api.nvim_win_get_cursor(0)[1] == 2, tostring(vim.api.nvim_win_get_cursor(0)[1]))
+vim.api.nvim_buf_set_lines(form_buf, 0, -1, false, { "", "formy", "NULL" })
 vim.api.nvim_buf_call(form_buf, function()
   vim.cmd("write")
 end)
@@ -733,6 +804,62 @@ step(
   vim.api.nvim_buf_get_name(qbuf)
 )
 step("bind: global default untouched", sqledit.status() == "testdb/main", sqledit.status())
+
+-- --------------------------------------------------------- cross-table copy
+-- yank a cell block in one table (ctrl+v y), paste it onto a block in
+-- another table (ctrl+v p) — per-row UPDATEs in one transaction
+query_sync("UPDATE pets SET name = 'rex', weight = 12.5 WHERE id = 1")
+query_sync("UPDATE pets SET name = 'mi,a', weight = NULL WHERE id = 2")
+query_sync("DELETE FROM pets_copy")
+query_sync("INSERT INTO pets_copy (id, name, weight) VALUES (10, 'aaa', 1), (11, 'bbb', 2)")
+
+sqledit.run("SELECT id, name, weight FROM pets ORDER BY id")
+wait_grid("rex")
+vim.api.nvim_set_current_win(gwin)
+line1 = grid_lines()[1]
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("rex") - 1 })
+vim.cmd([[execute "normal! \<C-v>"]])
+vim.api.nvim_win_set_cursor(gwin, { 2, #grid_lines()[2] - 1 })
+grid.yank_cells()
+step("cellyank: tsv in register", vim.fn.getreg('"') == "rex\t12.5\nmi,a\tNULL", vim.inspect(vim.fn.getreg('"')))
+
+sqledit.run("SELECT id, name, weight FROM pets_copy ORDER BY id")
+wait_grid("aaa")
+vim.api.nvim_set_current_win(gwin)
+line1 = grid_lines()[1]
+confirm_prompts = {}
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("aaa") - 1 })
+vim.cmd([[execute "normal! \<C-v>"]])
+vim.api.nvim_win_set_cursor(gwin, { 2, #grid_lines()[2] - 1 })
+grid.paste_cells()
+vim.wait(5000, function()
+  local e, r = query_sync("SELECT name FROM pets_copy WHERE id = 10")
+  return r and r.rows[1][1] == "rex"
+end)
+qerr, qres = query_sync("SELECT name, weight FROM pets_copy ORDER BY id")
+step(
+  "cellpaste: values landed per row",
+  qres and qres.rows[1][1] == "rex" and qres.rows[1][2] == 12.5 and qres.rows[2][1] == "mi,a" and qres.rows[2][2] == vim.NIL,
+  vim.inspect(qres and qres.rows)
+)
+step(
+  "cellpaste: confirm shows shape + origin",
+  confirm_prompts[1] ~= nil and confirm_prompts[1]:match("2 row%(s%) × 2 column%(s%)") ~= nil and confirm_prompts[1]:match("yanked off pets on testdb/main") ~= nil,
+  confirm_prompts[1]
+)
+step("cellpaste: grid mirrors locally", grid_text():match("rex") ~= nil and grid_text():match("aaa") == nil, grid_text():sub(1, 80))
+
+-- shape mismatch refused (one target row for a two-row block)
+capture_notify()
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("│") + 2 })
+vim.cmd([[execute "normal! \<C-v>"]])
+vim.api.nvim_win_set_cursor(gwin, { 1, #grid_lines()[1] - 1 })
+grid.paste_cells()
+vim.wait(3000, function()
+  return last_err():match("mismatch") ~= nil
+end)
+step("cellpaste: shape mismatch refused", last_err():match("row count mismatch: yanked 2, selected 1") ~= nil, last_err())
+vim.notify = orig_notify
 
 -- ------------------------------------------------------------------- tree
 local tree = require("sqledit.tree")

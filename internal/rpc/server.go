@@ -214,6 +214,36 @@ func (s *Server) dispatch(req *request) (any, error) {
 		}
 		return conn.Query(ctx, p.SQL, p.Params, p.MaxRows)
 
+	case "batch":
+		var p struct {
+			ID         string         `json:"id"`
+			Statements []db.Statement `json:"statements"`
+		}
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return nil, err
+		}
+		if len(p.Statements) == 0 {
+			return nil, fmt.Errorf("empty batch")
+		}
+		for si, st := range p.Statements {
+			for i, v := range st.Params {
+				switch v.(type) {
+				case string, nil:
+				default:
+					return nil, fmt.Errorf("statement %d param %d: must be string or null, got %T", si+1, i+1, v)
+				}
+			}
+		}
+		conn, err := s.conn(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := conn.Batch(ctx, p.Statements)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"rows_affected": affected}, nil
+
 	case "objects":
 		var p struct {
 			ID string `json:"id"`

@@ -119,6 +119,26 @@ func (c *SQLiteConn) Query(ctx context.Context, sqlText string, params []any, ma
 	return res, nil
 }
 
+func (c *SQLiteConn) Batch(ctx context.Context, stmts []Statement) ([]int64, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	affected := make([]int64, len(stmts))
+	for i, st := range stmts {
+		res, err := tx.ExecContext(ctx, st.SQL, st.Params...)
+		if err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i+1, err)
+		}
+		affected[i], _ = res.RowsAffected()
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return affected, nil
+}
+
 func (c *SQLiteConn) Objects(ctx context.Context) ([]Object, error) {
 	rows, err := c.db.QueryContext(ctx, `
 		SELECT name, type FROM sqlite_master

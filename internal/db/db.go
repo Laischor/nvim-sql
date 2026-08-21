@@ -47,12 +47,21 @@ type Result struct {
 	DurationMS   int64        `json:"duration_ms"`
 }
 
+// Statement is one parameterized statement of a Batch.
+type Statement struct {
+	SQL    string `json:"sql"`
+	Params []any  `json:"params"`
+}
+
 // Conn is one live connection to a specific database.
 type Conn interface {
 	// Query runs sql with optional positional params ($1… for postgres,
 	// ? for sqlite). Param values are strings or nil — servers cast text
 	// to the target column type.
 	Query(ctx context.Context, sql string, params []any, maxRows int) (*Result, error)
+	// Batch runs the statements in one transaction and returns the
+	// rows-affected count per statement. Any error rolls everything back.
+	Batch(ctx context.Context, stmts []Statement) ([]int64, error)
 	Objects(ctx context.Context) ([]Object, error)
 	Columns(ctx context.Context, schema, table string) ([]Column, error)
 	Close()

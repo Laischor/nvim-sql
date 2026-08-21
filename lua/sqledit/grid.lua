@@ -23,6 +23,10 @@ local state = {
 
 local MAX_CELL_WIDTH = 60
 
+-- Cell block yanked with visual `y`, for pasting into another grid as
+-- per-row UPDATEs. Survives re-renders and connection switches.
+local cell_clip = nil -- {columns = {names}, rows = {{v, ...}}, from = "label"}
+
 local function notify_err(msg)
   vim.notify("sqledit: " .. msg, vim.log.levels.ERROR)
 end
@@ -126,6 +130,12 @@ local function ensure_buffers()
   vim.keymap.set("n", "p", function()
     M.paste()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: insert rows from register" })
+  vim.keymap.set("x", "y", function()
+    M.yank_cells()
+  end, { buffer = state.buf, desc = "sqledit: yank cell block" })
+  vim.keymap.set("x", "p", function()
+    M.paste_cells()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: paste cell block as UPDATEs" })
   vim.keymap.set("n", "o", function()
     M.insert_row()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: insert new row (form)" })
@@ -523,38 +533,63 @@ end
 
 ---Write `input` into column `col` of the given row indices via one
 ---parameterized UPDATE. Input semantics: "NULL" = SQL NULL, '' = empty
----string, empty input = no change.
+---string, empty input = no change, "=other_column" = copy that column's
+---value row by row (SET col = other_column, evaluated by the server —
+---each row gets its own value).
 local function apply_update(rows, col, input)
   local src = state.meta.source
   local result = state.result
   local table_cols = state.table_columns
 
   if input == "" then
-    vim.notify("sqledit: no change (NULL for null, '' for empty string)")
+    vim.notify("sqledit: no change (NULL for null, '' for empty string, =column to copy a column)")
     return
   end
-  local new_value
-  if input == "NULL" then
-    new_value = vim.NIL
-  elseif input == "''" then
-    new_value = ""
+
+  local col_name = result.columns[col].name
+  local params = {}
+  local set_expr, new_value, copy_col
+
+  local copy_src = input:match("^=%s*(.-)%s*$")
+  if copy_src and copy_src ~= "" then
+    for _, tc in ipairs(table_cols) do
+      if tc.name:lower() == copy_src:lower() then
+        copy_col = tc.name
+        break
+      end
+    end
+    if not copy_col then
+      notify_err(("no column %q in %s.%s (=column copies another column)"):format(copy_src, src.schema, src.table_))
+      return
+    end
+    if copy_col == col_name then
+      notify_err("source and target column are the same")
+      return
+    end
+    set_expr = quote_ident(copy_col)
   else
-    new_value = input
+    if input == "NULL" then
+      new_value = vim.NIL
+    elseif input == "''" then
+      new_value = ""
+    else
+      new_value = input
+    end
+    table.insert(params, new_value)
+    set_expr = placeholder(1)
   end
 
-  local params = { new_value }
   local groups, gerr = build_pk_where(table_cols, rows, params)
   if not groups then
     notify_err(gerr)
     return
   end
 
-  local col_name = result.columns[col].name
   local sql = ("UPDATE %s.%s SET %s = %s WHERE %s"):format(
     quote_ident(src.schema),
     quote_ident(src.table_),
     quote_ident(col_name),
-    placeholder(1),
+    set_expr,
     table.concat(groups, " OR ")
   )
 
@@ -564,13 +599,13 @@ local function apply_update(rows, col, input)
     if #preview > 200 then
       preview = preview:sub(1, 197) .. "..."
     end
-    local prompt = ("Update %d row(s) on %s%s?\n\n  %s.%s = %s\n\n  %s"):format(
+    local what = copy_col and ("%s.%s = %s (column copy, per row)"):format(src.table_, col_name, copy_col)
+      or ("%s.%s = %s"):format(src.table_, col_name, input)
+    local prompt = ("Update %d row(s) on %s%s?\n\n  %s\n\n  %s"):format(
       #rows,
       state.meta.conn,
       state.meta.prod and " [PROD]" or "",
-      src.table_,
-      col_name,
-      input,
+      what,
       preview
     )
     if vim.fn.confirm(prompt, "&Yes\n&No", 2, state.meta.prod and "Warning" or "Question") ~= 1 then
@@ -588,13 +623,35 @@ local function apply_update(rows, col, input)
       notify_err(("expected %d row(s), %d affected — press r to reload"):format(#rows, affected))
       return
     end
-    for _, row in ipairs(rows) do
-      -- keep numbers numeric so alignment survives the local update
-      local stored = new_value
-      if stored ~= vim.NIL and tonumber(stored) ~= nil and type(result.rows[row][col]) == "number" then
-        stored = tonumber(stored)
+    if copy_col then
+      local src_idx
+      for i, c in ipairs(result.columns) do
+        if c.name == copy_col then
+          src_idx = i
+          break
+        end
       end
-      result.rows[row][col] = stored
+      if not src_idx then
+        -- source column not in the result: can't mirror locally, refetch
+        if state.meta.rerun then
+          state.meta.rerun()
+        end
+        vim.notify(("sqledit: copied %s into %s for %d row(s) in %s.%s"):format(
+          copy_col, col_name, #rows, src.schema, src.table_))
+        return
+      end
+      for _, row in ipairs(rows) do
+        result.rows[row][col] = result.rows[row][src_idx]
+      end
+    else
+      for _, row in ipairs(rows) do
+        -- keep numbers numeric so alignment survives the local update
+        local stored = new_value
+        if stored ~= vim.NIL and tonumber(stored) ~= nil and type(result.rows[row][col]) == "number" then
+          stored = tonumber(stored)
+        end
+        result.rows[row][col] = stored
+      end
     end
     local cursor = vim.api.nvim_win_get_cursor(state.win)
     redraw()
@@ -737,6 +794,25 @@ local function selected_rows()
     return nil
   end
   return { pos[1] }
+end
+
+---Visual selection as rows plus the spanned column range (from the
+---selection's corner columns; linewise selections span all columns).
+---Leaves visual mode.
+local function selected_block()
+  local rows = selected_rows()
+  if not rows then
+    return nil
+  end
+  local c1 = column_at(vim.api.nvim_buf_get_mark(state.buf, "<")[2] + 1)
+  local c2 = column_at(vim.api.nvim_buf_get_mark(state.buf, ">")[2] + 1)
+  if not c1 or not c2 then
+    return nil
+  end
+  if c1 > c2 then
+    c1, c2 = c2, c1
+  end
+  return rows, c1, c2
 end
 
 ---Yank rows as csv/json/insert into the unnamed register and, when
@@ -914,6 +990,157 @@ function M.paste()
 end
 
 ---Delete the selected rows (or the cursor row) — always confirmed.
+---Yank the visually selected cell block (rows × columns). Meant for
+---copying data between tables: paste it onto a block in another grid
+---(visual `p`) as per-row UPDATEs. Also puts a TSV copy into the
+---unnamed register. Works in any grid, joins included.
+function M.yank_cells()
+  if not (state.result and #(state.result.rows or {}) > 0) then
+    return
+  end
+  local rows, c1, c2 = selected_block()
+  if not rows then
+    return
+  end
+  local cols = {}
+  for c = c1, c2 do
+    table.insert(cols, state.result.columns[c].name)
+  end
+  local values, text = {}, {}
+  for _, r in ipairs(rows) do
+    local vrow, trow = {}, {}
+    for c = c1, c2 do
+      local v = state.result.rows[r][c]
+      table.insert(vrow, v == nil and vim.NIL or v)
+      table.insert(trow, cell_text(v))
+    end
+    table.insert(values, vrow)
+    table.insert(text, table.concat(trow, "\t"))
+  end
+  local src = state.meta.source
+  cell_clip = {
+    columns = cols,
+    rows = values,
+    from = ("%s on %s"):format(src and (src.schema and src.schema .. "." .. src.table_ or src.table_) or "a query", state.meta.conn),
+  }
+  vim.fn.setreg('"', table.concat(text, "\n"))
+  vim.notify(("sqledit: yanked %d×%d cell block (visual p in a grid pastes it as UPDATEs)"):format(#rows, #cols))
+end
+
+---Paste the yanked cell block onto the visually selected block: one
+---parameterized UPDATE per row, all in a single transaction (rolled
+---back entirely on any failure). Rows and columns are matched by
+---position, so the selection must have the yanked block's shape.
+function M.paste_cells()
+  if not editable_or_complain() then
+    return
+  end
+  if not cell_clip then
+    notify_err("no yanked cell block — select cells in a grid and press y first")
+    return
+  end
+  local rows, c1, c2 = selected_block()
+  if not rows then
+    notify_err("no rows selected")
+    return
+  end
+  local ncols = c2 - c1 + 1
+  if #rows ~= #cell_clip.rows then
+    notify_err(("row count mismatch: yanked %d, selected %d"):format(#cell_clip.rows, #rows))
+    return
+  end
+  if ncols ~= #cell_clip.columns then
+    notify_err(("column count mismatch: yanked %d, selected %d"):format(#cell_clip.columns, ncols))
+    return
+  end
+  local clip = cell_clip
+  get_table_columns(function(table_cols)
+    local src = state.meta.source
+    local result = state.result
+    local known = {}
+    for _, tc in ipairs(table_cols) do
+      known[tc.name] = true
+    end
+    for c = c1, c2 do
+      local name = result.columns[c].name
+      if not known[name] then
+        notify_err(("%q is not a column of %s.%s (computed/aliased?)"):format(name, src.schema, src.table_))
+        return
+      end
+    end
+
+    local statements = {}
+    for i, r in ipairs(rows) do
+      local params, sets = {}, {}
+      for j = 0, ncols - 1 do
+        local v = clip.rows[i][j + 1]
+        if v == nil or v == vim.NIL then
+          table.insert(params, vim.NIL)
+        elseif type(v) == "table" then
+          table.insert(params, vim.json.encode(v))
+        else
+          table.insert(params, tostring(v))
+        end
+        table.insert(sets, quote_ident(result.columns[c1 + j].name) .. " = " .. placeholder(#params))
+      end
+      local groups, gerr = build_pk_where(table_cols, { r }, params)
+      if not groups then
+        notify_err(gerr)
+        return
+      end
+      table.insert(statements, {
+        sql = ("UPDATE %s.%s SET %s WHERE %s"):format(
+          quote_ident(src.schema),
+          quote_ident(src.table_),
+          table.concat(sets, ", "),
+          groups[1]
+        ),
+        params = params,
+      })
+    end
+
+    local preview = statements[1].sql
+    if #preview > 200 then
+      preview = preview:sub(1, 197) .. "..."
+    end
+    local prompt = ("Update %d row(s) × %d column(s) in %s.%s on %s%s\nwith the block yanked off %s?\n\n  %s"):format(
+      #rows,
+      ncols,
+      src.schema,
+      src.table_,
+      state.meta.conn,
+      state.meta.prod and " [PROD]" or "",
+      clip.from,
+      preview
+    )
+    if vim.fn.confirm(prompt, "&Yes\n&No", 2, state.meta.prod and "Warning" or "Question") ~= 1 then
+      return
+    end
+
+    rpc.request("batch", { id = state.meta.conn, statements = statements }, function(err, res)
+      if err then
+        notify_err(err)
+        return
+      end
+      for _, n in ipairs(res.rows_affected or {}) do
+        if n ~= 1 then
+          notify_err(("expected 1 row per statement, got %d — press r to reload"):format(n))
+          return
+        end
+      end
+      for i, r in ipairs(rows) do
+        for j = 0, ncols - 1 do
+          result.rows[r][c1 + j] = clip.rows[i][j + 1]
+        end
+      end
+      local cursor = vim.api.nvim_win_get_cursor(state.win)
+      redraw()
+      vim.api.nvim_win_set_cursor(state.win, cursor)
+      vim.notify(("sqledit: updated %d row(s) in %s.%s"):format(#rows, src.schema, src.table_))
+    end)
+  end)
+end
+
 function M.delete_rows()
   if not editable_or_complain() then
     return
@@ -979,9 +1206,11 @@ function M.delete_rows()
   end)
 end
 
----Open a one-line-per-column form in a float; :w runs the INSERT.
+---Open an insert form in a float: one line per column, the line text is
+---the value (column labels are virtual and can't be mangled). :w or
+---<CR> (normal mode) runs the INSERT, <Tab>/<S-Tab> hop between fields.
 ---Empty value = column omitted (DB default / serial pk), literal NULL
----= SQL NULL.
+---= SQL NULL, '' = empty string.
 function M.insert_row()
   if not editable_or_complain() then
     return
@@ -995,13 +1224,16 @@ function M.insert_row()
     vim.bo[buf].filetype = "sqledit_insert"
     vim.api.nvim_buf_set_name(buf, ("sqledit://insert/%s.%s"):format(src.schema, src.table_))
 
-    local lines = {}
-    for _, c in ipairs(table_cols) do
-      table.insert(lines, c.name .. " = ")
-    end
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.fn["repeat"]({ "" }, #table_cols))
     vim.bo[buf].modified = false
 
+    local label_w = 0
+    for _, c in ipairs(table_cols) do
+      label_w = math.max(label_w, vim.fn.strdisplaywidth(c.name))
+    end
+
+    -- static part: right-aligned label + separator per line, type hints
+    -- pinned to the right edge
     local ns = vim.api.nvim_create_namespace("sqledit_insert_form")
     for i, c in ipairs(table_cols) do
       local hints = { c.type }
@@ -1012,13 +1244,40 @@ function M.insert_row()
         table.insert(hints, "not null")
       end
       vim.api.nvim_buf_set_extmark(buf, ns, i - 1, 0, {
-        virt_text = { { "  " .. table.concat(hints, " · "), "Comment" } },
-        virt_text_pos = "eol",
+        virt_text = {
+          { pad(c.name, label_w, true), c.pk and "Special" or "Identifier" },
+          { " │ ", "FloatBorder" },
+        },
+        virt_text_pos = "inline",
+        right_gravity = false,
+      })
+      vim.api.nvim_buf_set_extmark(buf, ns, i - 1, 0, {
+        virt_text = { { table.concat(hints, " · ") .. " ", "Comment" } },
+        virt_text_pos = "right_align",
       })
     end
 
-    local width = math.min(vim.o.columns - 4, 70)
-    local height = math.min(#lines, vim.o.lines - 6)
+    -- ghost "default" on empty fields, refreshed while typing
+    local ns_ghost = vim.api.nvim_create_namespace("sqledit_insert_ghost")
+    local function refresh_ghosts()
+      vim.api.nvim_buf_clear_namespace(buf, ns_ghost, 0, -1)
+      for i, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+        if line == "" then
+          vim.api.nvim_buf_set_extmark(buf, ns_ghost, i - 1, 0, {
+            virt_text = { { "default", "NonText" } },
+            virt_text_pos = "inline",
+          })
+        end
+      end
+    end
+    refresh_ghosts()
+    vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+      buffer = buf,
+      callback = refresh_ghosts,
+    })
+
+    local width = math.min(vim.o.columns - 4, math.max(56, label_w + 44))
+    local height = math.min(#table_cols, vim.o.lines - 6)
     local win = vim.api.nvim_open_win(buf, true, {
       relative = "editor",
       row = math.floor((vim.o.lines - height) / 2) - 1,
@@ -1026,24 +1285,61 @@ function M.insert_row()
       width = width,
       height = height,
       border = "rounded",
-      title = (" INSERT INTO %s.%s — :w runs it, empty = default, NULL = null "):format(src.schema, src.table_),
+      title = (" INSERT INTO %s.%s%s "):format(src.schema, src.table_, state.meta.prod and "  [PROD]" or ""),
       title_pos = "center",
+      footer = " <CR>/:w insert · <Tab> field · NULL = null · '' = empty · q close ",
+      footer_pos = "center",
     })
     vim.wo[win].number = false
     vim.wo[win].signcolumn = "no"
+    vim.wo[win].cursorline = true
+    vim.wo[win].wrap = false
+
+    -- field hopping: wraps around, lands at the end of the value
+    local function goto_field(delta)
+      local l = vim.api.nvim_win_get_cursor(win)[1]
+      local target = ((l - 1 + delta) % #table_cols) + 1
+      local text = vim.api.nvim_buf_get_lines(buf, target - 1, target, false)[1] or ""
+      vim.api.nvim_win_set_cursor(win, { target, #text })
+    end
+    vim.keymap.set({ "n", "i" }, "<Tab>", function()
+      goto_field(1)
+    end, { buffer = buf, nowait = true, desc = "sqledit: next field" })
+    vim.keymap.set({ "n", "i" }, "<S-Tab>", function()
+      goto_field(-1)
+    end, { buffer = buf, nowait = true, desc = "sqledit: previous field" })
+    -- one line per column: <CR> in insert mode hops instead of splitting
+    vim.keymap.set("i", "<CR>", function()
+      goto_field(1)
+    end, { buffer = buf, nowait = true, desc = "sqledit: next field" })
+    vim.keymap.set("n", "<CR>", "<cmd>write<cr>", { buffer = buf, nowait = true, desc = "sqledit: run insert" })
     vim.keymap.set("n", "q", "<cmd>bwipeout!<cr>", { buffer = buf, nowait = true })
+
+    -- start on the first non-pk field (serial pks are usually left empty)
+    for i, c in ipairs(table_cols) do
+      if not c.pk then
+        vim.api.nvim_win_set_cursor(win, { i, 0 })
+        break
+      end
+    end
 
     vim.api.nvim_create_autocmd("BufWriteCmd", {
       buffer = buf,
       callback = function()
+        local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+        if #lines ~= #table_cols then
+          notify_err("insert: one line per column — don't add or remove lines")
+          return
+        end
         local names, vals, params = {}, {}, {}
-        for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-          local name, value = line:match("^%s*([%w_]+)%s*=%s*(.*)$")
-          if name and vim.trim(value) ~= "" then
-            value = vim.trim(value)
-            table.insert(names, quote_ident(name))
+        for i, line in ipairs(lines) do
+          local value = vim.trim(line)
+          if value ~= "" then
+            table.insert(names, quote_ident(table_cols[i].name))
             if value == "NULL" then
               table.insert(params, vim.NIL)
+            elseif value == "''" then
+              table.insert(params, "")
             else
               table.insert(params, value)
             end
