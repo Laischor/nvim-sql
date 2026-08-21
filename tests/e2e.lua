@@ -55,9 +55,9 @@ local function await(fn, timeout)
   return done, aerr, ares
 end
 
-local function query_sync(sql)
+local function query_sync(sql, params)
   local _, e, r = await(function(cb)
-    rpc.request("query", { id = "testdb/main", sql = sql }, cb)
+    rpc.request("query", { id = "testdb/main", sql = sql, params = params }, cb)
   end)
   return e, r
 end
@@ -848,6 +848,20 @@ step(
   confirm_prompts[1]
 )
 step("cellpaste: grid mirrors locally", grid_text():match("rex") ~= nil and grid_text():match("aaa") == nil, grid_text():sub(1, 80))
+
+-- gy: full content of a truncated cell (display cuts at 60, register doesn't)
+local long_val = string.rep("x", 80) .. "\nline2"
+query_sync("UPDATE pets_copy SET name = ? WHERE id = 10", { long_val })
+sqledit.run("SELECT id, name FROM pets_copy WHERE id = 10")
+vim.wait(3000, function()
+  return grid_text():match("xxxx") ~= nil
+end)
+step("cellyank: display truncated", grid_lines()[1]:match("…") ~= nil and #grid_lines()[1] < 120, grid_lines()[1]:sub(1, 40))
+vim.api.nvim_set_current_win(gwin)
+line1 = grid_lines()[1]
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("x") - 1 })
+grid.yank_cell()
+step("cellyank: gy yanks full content", vim.fn.getreg('"') == long_val, tostring(#vim.fn.getreg('"')))
 
 -- shape mismatch refused (one target row for a two-row block)
 capture_notify()

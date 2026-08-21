@@ -133,6 +133,9 @@ local function ensure_buffers()
   vim.keymap.set("x", "y", function()
     M.yank_cells()
   end, { buffer = state.buf, desc = "sqledit: yank cell block" })
+  vim.keymap.set("n", "gy", function()
+    M.yank_cell()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: yank full cell content" })
   vim.keymap.set("x", "p", function()
     M.paste_cells()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: paste cell block as UPDATEs" })
@@ -1027,6 +1030,32 @@ function M.yank_cells()
   vim.fn.setreg('"', tsv)
   pcall(vim.fn.setreg, "+", tsv)
   vim.notify(("sqledit: yanked %d×%d cell block (visual p in a grid pastes it as UPDATEs)"):format(#rows, #cols))
+end
+
+---Yank the full content of the cell under the cursor into register +
+---clipboard. The grid display truncates long values ("…"); the register
+---gets the real thing, newlines included. NULL yanks as literal NULL.
+function M.yank_cell()
+  if not (state.result and #(state.result.rows or {}) > 0) then
+    return
+  end
+  local row, col = cell_at_cursor()
+  if not row then
+    notify_err("no cell under cursor")
+    return
+  end
+  local v = state.result.rows[row][col]
+  local text
+  if v == nil or v == vim.NIL then
+    text = "NULL"
+  elseif type(v) == "table" then
+    text = vim.json.encode(v)
+  else
+    text = tostring(v)
+  end
+  vim.fn.setreg('"', text)
+  pcall(vim.fn.setreg, "+", text)
+  vim.notify(("sqledit: yanked %s (%d chars)"):format(state.result.columns[col].name, #text))
 end
 
 ---Paste the yanked cell block onto the visually selected block: one

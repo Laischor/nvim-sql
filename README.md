@@ -47,7 +47,9 @@ editing instead of a re-implementation.
 - **Cell block copy between tables** — select cells with `<C-v>` and
   `y` to yank the block (works in any grid, joins included; a TSV copy
   lands in the unnamed register and the system clipboard, so it pastes
-  as plain text into any buffer too). In the target grid, select a same-shaped
+  as plain text into any buffer too). `gy` yanks the full content of
+  the cell under the cursor — untruncated, newlines preserved (the
+  display cuts long values at 60 chars, the register never does). In the target grid, select a same-shaped
   block and `p`: one UPDATE per row, all in a single transaction
   (all-or-nothing), rows and columns matched by position. The way to
   move a column's values from one table into another when cleaning up
