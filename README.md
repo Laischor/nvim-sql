@@ -33,7 +33,11 @@ editing instead of a re-implementation.
   `''` = empty string, empty input = no change (NULL cells prefill
   empty), `=column` copies another column's value row by row (server-side
   `SET a = b` — each row gets its own value; the way to move data from
-  one column into another). `dd` / visual `d` deletes rows — always
+  one column into another). `x` sets the cell under the cursor to NULL
+  without a prompt; on a `<C-v>` block (or any visual selection) it
+  NULLs every cell in the block in one UPDATE (`SET a = NULL, b = NULL`
+  for all spanned columns, confirmed with a statement preview) — the
+  quick way to clear several columns at once. `dd` / visual `d` deletes rows — always
   behind a confirm. `r` re-runs the query.
 - **FK jump** — `gd` on a foreign-key cell opens the referenced row.
   Works recursively: the target grid is a normal grid.
@@ -184,6 +188,7 @@ Suggestions need an active connection (`:Sqledit connect`);
 identifiers in alias definitions are not resolved yet.
 
 Grid keys: `c` edit cell (visual: edit column for selected rows),
+`x` set cell to NULL (visual/`<C-v>` block: all selected cells, one UPDATE),
 `dd`/visual `d` delete row(s) with confirm,
 `yc`/`yj`/`yi` yank row(s) as CSV/JSON/INSERT (visual: selection),
 `p` insert clipboard rows into this grid's table, `o` insert-row form,

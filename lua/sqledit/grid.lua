@@ -148,6 +148,12 @@ local function ensure_buffers()
   vim.keymap.set("x", "d", function()
     M.delete_rows()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: delete selected rows" })
+  vim.keymap.set("n", "x", function()
+    M.null_cells()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: set cell to NULL" })
+  vim.keymap.set("x", "x", function()
+    M.null_cells()
+  end, { buffer = state.buf, nowait = true, desc = "sqledit: set selected cells to NULL" })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
     buffer = state.buf,
@@ -1439,6 +1445,106 @@ function M.edit_cells()
     return
   end
   start_edit(rows, col)
+end
+
+---Set the cell under the cursor (or every cell of the visual block) to
+---NULL without going through the input: one UPDATE, `SET a = NULL,
+---b = NULL` for all spanned columns across the selected rows. Confirmed
+---when more than one cell is touched or on prod.
+function M.null_cells()
+  if not editable_or_complain() then
+    return
+  end
+  local rows, c1, c2
+  local mode = vim.fn.mode()
+  if mode == "v" or mode == "V" or mode == "\22" then
+    rows, c1, c2 = selected_block()
+    if not rows then
+      notify_err("no cells selected")
+      return
+    end
+  else
+    local row, col = cell_at_cursor()
+    if not row then
+      notify_err("no cell under cursor")
+      return
+    end
+    rows, c1, c2 = { row }, col, col
+  end
+
+  get_table_columns(function(table_cols)
+    local src = state.meta.source
+    local result = state.result
+    local known = {}
+    for _, tc in ipairs(table_cols) do
+      known[tc.name] = true
+    end
+    local sets, names = {}, {}
+    for c = c1, c2 do
+      local name = result.columns[c].name
+      if not known[name] then
+        notify_err(("%q is not a column of %s.%s (computed/aliased?)"):format(name, src.schema, src.table_))
+        return
+      end
+      table.insert(sets, quote_ident(name) .. " = NULL")
+      table.insert(names, name)
+    end
+
+    local params = {}
+    local groups, gerr = build_pk_where(table_cols, rows, params)
+    if not groups then
+      notify_err(gerr)
+      return
+    end
+    local sql = ("UPDATE %s.%s SET %s WHERE %s"):format(
+      quote_ident(src.schema),
+      quote_ident(src.table_),
+      table.concat(sets, ", "),
+      table.concat(groups, " OR ")
+    )
+
+    local ncols = c2 - c1 + 1
+    if #rows * ncols > 1 or state.meta.prod then
+      local preview = sql
+      if #preview > 200 then
+        preview = preview:sub(1, 197) .. "..."
+      end
+      local prompt = ("Set %d row(s) × %d column(s) to NULL in %s.%s on %s%s?\n\n  %s\n\n  %s"):format(
+        #rows,
+        ncols,
+        src.schema,
+        src.table_,
+        state.meta.conn,
+        state.meta.prod and " [PROD]" or "",
+        table.concat(names, ", "),
+        preview
+      )
+      if vim.fn.confirm(prompt, "&Yes\n&No", 2, state.meta.prod and "Warning" or "Question") ~= 1 then
+        return
+      end
+    end
+
+    rpc.request("query", { id = state.meta.conn, sql = sql, params = params }, function(err, res)
+      if err then
+        notify_err(err)
+        return
+      end
+      local affected = res.rows_affected or 0
+      if affected ~= #rows then
+        notify_err(("expected %d row(s), %d affected — press r to reload"):format(#rows, affected))
+        return
+      end
+      for _, r in ipairs(rows) do
+        for c = c1, c2 do
+          result.rows[r][c] = vim.NIL
+        end
+      end
+      local cursor = vim.api.nvim_win_get_cursor(state.win)
+      redraw()
+      vim.api.nvim_win_set_cursor(state.win, cursor)
+      vim.notify(("sqledit: set %d cell(s) to NULL in %s.%s"):format(#rows * ncols, src.schema, src.table_))
+    end)
+  end)
 end
 
 return M

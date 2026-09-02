@@ -849,6 +849,49 @@ step(
 )
 step("cellpaste: grid mirrors locally", grid_text():match("rex") ~= nil and grid_text():match("aaa") == nil, grid_text():sub(1, 80))
 
+-- x: set cells to NULL without a prompt — single cell (no confirm),
+-- ctrl+v block across two columns (one UPDATE, confirmed)
+query_sync("UPDATE pets_copy SET name = 'nx1', weight = 1 WHERE id = 10")
+query_sync("UPDATE pets_copy SET name = 'nx2', weight = 2 WHERE id = 11")
+sqledit.run("SELECT id, name, weight FROM pets_copy ORDER BY id")
+wait_grid("nx1")
+vim.api.nvim_set_current_win(gwin)
+line1 = grid_lines()[1]
+confirm_prompts = {}
+vim.api.nvim_win_set_cursor(gwin, { 1, #line1 - 1 })
+grid.null_cells()
+vim.wait(5000, function()
+  local e, r = query_sync("SELECT weight FROM pets_copy WHERE id = 10")
+  return r and r.rows[1][1] == vim.NIL
+end)
+qerr, qres = query_sync("SELECT name, weight FROM pets_copy WHERE id = 10")
+step("nullcell: single cell nulled", qres and qres.rows[1][1] == "nx1" and qres.rows[1][2] == vim.NIL, vim.inspect(qres and qres.rows))
+step("nullcell: single cell not confirmed", #confirm_prompts == 0, vim.inspect(confirm_prompts))
+step("nullcell: grid mirrors locally", grid_lines()[1]:match("NULL") ~= nil, grid_lines()[1])
+
+line1 = grid_lines()[1]
+confirm_prompts = {}
+vim.api.nvim_win_set_cursor(gwin, { 1, line1:find("nx1") - 1 })
+vim.cmd([[execute "normal! \<C-v>"]])
+vim.api.nvim_win_set_cursor(gwin, { 2, #grid_lines()[2] - 1 })
+grid.null_cells()
+vim.wait(5000, function()
+  local e, r = query_sync("SELECT count(*) FROM pets_copy WHERE id IN (10, 11) AND name IS NULL AND weight IS NULL")
+  return r and r.rows[1][1] == 2
+end)
+qerr, qres = query_sync("SELECT name, weight FROM pets_copy WHERE id IN (10, 11) ORDER BY id")
+step(
+  "nullcell: block nulled both columns",
+  qres and qres.rows[1][1] == vim.NIL and qres.rows[1][2] == vim.NIL and qres.rows[2][1] == vim.NIL and qres.rows[2][2] == vim.NIL,
+  vim.inspect(qres and qres.rows)
+)
+step(
+  "nullcell: block confirm shows shape + columns",
+  confirm_prompts[1] ~= nil and confirm_prompts[1]:match("2 row%(s%) × 2 column%(s%) to NULL") ~= nil and confirm_prompts[1]:match("name, weight") ~= nil,
+  confirm_prompts[1]
+)
+step("nullcell: pk untouched", qres and #qres.rows == 2, vim.inspect(qres and qres.rows))
+
 -- gy: full content of a truncated cell (display cuts at 60, register doesn't)
 local long_val = string.rep("x", 80) .. "\nline2"
 query_sync("UPDATE pets_copy SET name = ? WHERE id = 10", { long_val })
