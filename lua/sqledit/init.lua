@@ -21,10 +21,21 @@ local state = {
   current = nil, -- connInfo from backend: {id, server, database, adapter, prod, readonly}
   last_sql = nil,
   query_count = 0,
+  error_shown = false,
 }
 
 local function notify_err(msg)
+  state.error_shown = true
   vim.notify("sqledit: " .. msg, vim.log.levels.ERROR)
+end
+
+---A notified error lingers in the message area with nothing to displace it
+---on success — clear it so a clean run doesn't look failed.
+local function clear_error()
+  if state.error_shown then
+    state.error_shown = false
+    vim.api.nvim_echo({ { "" } }, false, {})
+  end
 end
 
 local function is_query_buf(buf)
@@ -221,6 +232,7 @@ function M.run(sql, conn)
       notify_err(err)
       return
     end
+    clear_error()
     require("sqledit.history").add(c.id, sql)
     grid.render(result, {
       conn = c.id,
