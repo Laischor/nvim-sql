@@ -1,5 +1,4 @@
-// Package db defines the adapter interface shared by the postgres and
-// sqlite backends, plus JSON-friendly result types.
+// Package db is the adapter interface for postgres and sqlite plus JSON-friendly result types.
 package db
 
 import (
@@ -7,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -53,22 +53,68 @@ type Statement struct {
 	Params []any  `json:"params"`
 }
 
-// Conn is one live connection to a specific database.
+// StatementResult is one statement of a script with its result.
+type StatementResult struct {
+	SQL string `json:"sql"`
+	*Result
+}
+
+// StatementError is the statement a script stopped at.
+type StatementError struct {
+	Index   int    `json:"index"`
+	SQL     string `json:"sql"`
+	Message string `json:"message"`
+}
+
+// ScriptResult holds the results up to the first failure, if any.
+type ScriptResult struct {
+	Results []StatementResult `json:"results"`
+	Failed  *StatementError   `json:"failed,omitempty"`
+}
+
+// TxWarning is a Commit/Rollback outcome the caller should know about.
+type TxWarning string
+
+func (w TxWarning) Error() string { return string(w) }
+
+// Conn is one live connection to a specific database; an open transaction pins one session for all calls.
 type Conn interface {
-	// Query runs sql with optional positional params ($1… for postgres,
-	// ? for sqlite). Param values are strings or nil — servers cast text
-	// to the target column type.
+	// Query runs one statement; params are strings or nil, servers cast text to the column type.
 	Query(ctx context.Context, sql string, params []any, maxRows int) (*Result, error)
-	// Batch runs the statements in one transaction and returns the
-	// rows-affected count per statement. Any error rolls everything back.
+	// Batch runs the statements atomically (own transaction, or a savepoint inside an open one).
 	Batch(ctx context.Context, stmts []Statement) ([]int64, error)
+	// Script splits sql into statements and runs them in order until one fails.
+	Script(ctx context.Context, sql string, maxRows int) (*ScriptResult, error)
+	Begin(ctx context.Context) error
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
+	InTx() bool
 	Objects(ctx context.Context) ([]Object, error)
 	Columns(ctx context.Context, schema, table string) ([]Column, error)
 	Close()
 }
 
-// Normalize converts a driver value into something that serializes cleanly
-// to JSON: nil, bool, number, or string. Anything exotic is stringified.
+// ErrNoTx / ErrInTx are the Begin/Commit/Rollback state errors.
+var (
+	ErrNoTx = errors.New("no transaction open")
+	ErrInTx = errors.New("transaction already open")
+)
+
+func runScript(ctx context.Context, sql string, maxRows int, run func(ctx context.Context, sql string, maxRows int) (*Result, error)) *ScriptResult {
+	stmts := SplitStatements(sql)
+	out := &ScriptResult{Results: make([]StatementResult, 0, len(stmts))}
+	for i, st := range stmts {
+		res, err := run(ctx, st, maxRows)
+		if err != nil {
+			out.Failed = &StatementError{Index: i + 1, SQL: st, Message: err.Error()}
+			break
+		}
+		out.Results = append(out.Results, StatementResult{SQL: st, Result: res})
+	}
+	return out
+}
+
+// Normalize maps a driver value to nil/bool/number/string for JSON; exotic types are stringified.
 func Normalize(v any) any {
 	switch t := v.(type) {
 	case nil:

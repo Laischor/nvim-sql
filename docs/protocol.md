@@ -38,20 +38,44 @@ maintenance database (postgres) or `main` (sqlite). The returned `id`
 ### `query {id, sql, max_rows?, params?}` → result
 ```
 {columns: [{name, type}], rows: [[...]], row_count, more,
- rows_affected, duration_ms}
+ rows_affected, duration_ms, tx}
 ```
-- `max_rows` defaults to 500; `more: true` means the result was truncated.
+- One statement. `max_rows` defaults to 500; `more: true` means the result
+  was truncated.
 - `params` are positional (`$1…` postgres, `?` sqlite) and must be strings
   or null — servers cast text to the column type. Used by the edit grid so
   values are never concatenated into SQL.
 - Cell values are JSON null/bool/number/string; timestamps and byte arrays are
   stringified, json/array columns keep their structure.
 - Statements without a result set return empty `columns` and `rows_affected`.
+- `tx` is true while the connection has a transaction open afterwards (see
+  below).
 
-### `batch {id, statements: [{sql, params}]}` → `{rows_affected: [int]}`
-Runs the statements in one transaction; any failure rolls everything
-back. Same text-or-null param rule as `query`. Used by the grid's cell
-block paste (one UPDATE per row).
+### `script {id, sql, max_rows?}` → `{results: [{sql, ...result}], failed?, tx}`
+Splits `sql` into statements (quotes, comments, `$$` bodies and
+`CREATE TRIGGER … BEGIN … END` respected) and runs them in order on one
+session. `results` holds one `query`-shaped result per statement that ran,
+each with its `sql`. Execution stops at the first error:
+`failed: {index, sql, message}` (1-based). Without an open transaction,
+statements before the failure stay applied (autocommit).
+
+### `batch {id, statements: [{sql, params}]}` → `{rows_affected: [int], tx}`
+Runs the statements atomically; any failure rolls everything back. Same
+text-or-null param rule as `query`. Used by the grid's cell block paste
+(one UPDATE per row). Inside an open transaction the batch runs in a
+savepoint, so a failure leaves the outer transaction intact.
+
+### `begin {id}` / `commit {id}` / `rollback {id}` → `{tx, message?}`
+Explicit transaction control. While a transaction is open, the connection
+pins one database session and every method on that `id` runs on it
+(serialized). A `BEGIN` typed into `query`/`script` opens one the same way,
+a typed `COMMIT`/`ROLLBACK` ends it; the `tx` flag on every response tells
+the frontend the current state. `commit` on a postgres transaction that an
+earlier error aborted succeeds with `tx: false` and a `message` (postgres
+rolled back). `begin` with a transaction open and `commit`/`rollback`
+without one are errors. `disconnect` rolls an open transaction back.
+sqlite has no autocommit probe, so its state follows the statements'
+first word (`begin`/`savepoint` open, `commit`/`end`/`rollback` close).
 
 ### `objects {id}` → `{objects: [{schema, name, type}]}`
 Tables, views, matviews. `type` ∈ `table | view | matview | foreign`.

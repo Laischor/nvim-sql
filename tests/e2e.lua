@@ -1,9 +1,4 @@
--- Headless end-to-end suite. Run via `make test-e2e` (needs nvim on PATH
--- and a built bin/sqledit), or directly:
---
---   XDG_STATE_HOME=$(mktemp -d) nvim --headless --clean -u NONE -l tests/e2e.lua
---
--- Uses a throwaway sqlite database; no postgres required.
+-- Headless e2e suite on a throwaway sqlite db: `make test-e2e` (needs nvim + bin/sqledit).
 local this = vim.fs.normalize(debug.getinfo(1, "S").source:sub(2))
 local root = vim.fs.normalize(vim.fs.dirname(this) .. "/..")
 local tmp = vim.fn.tempname()
@@ -178,6 +173,66 @@ vim.wait(5000, function()
   return g_header():match("^n") ~= nil
 end)
 step("run_buffer result", grid_lines()[1] ~= nil and grid_lines()[1]:match("2") ~= nil, grid_lines()[1])
+
+-- --------------------------------------------------------- multi-statement
+query_sync("CREATE TABLE tx_t (id integer primary key, v int)")
+sqledit.run("INSERT INTO tx_t (id, v) VALUES (1, 10), (2, 20); SELECT v FROM tx_t ORDER BY id")
+vim.wait(5000, function()
+  return g_header():match("^v") ~= nil
+end)
+step("multi: last result set shown", g_header():match("^v") ~= nil and (grid_lines()[2] or ""):match("20") ~= nil, grid_text())
+step("multi: summary in winbar", g_winbar():match("2 statements") ~= nil and g_winbar():match("2 affected") ~= nil, g_winbar())
+
+capture_notify()
+sqledit.run("SELECT id AS first_ok FROM tx_t; SELEC nope; SELECT 3")
+vim.wait(5000, function()
+  return #err_msgs > 0
+end)
+vim.notify = orig_notify
+step("multi: error names the statement", last_err():match("statement 2") ~= nil, last_err())
+step("multi: results before the error shown", g_header():match("^first_ok") ~= nil, g_header())
+
+-- ------------------------------------------------------------ transactions
+sqledit.begin()
+vim.wait(5000, function()
+  return sqledit.status():match("%[TX%]") ~= nil
+end)
+step("tx: status shows [TX]", sqledit.status() == "testdb/main [TX]", sqledit.status())
+sqledit.run("UPDATE tx_t SET v = 99 WHERE id = 1")
+drain(300)
+local _, txr = query_sync("SELECT v FROM tx_t WHERE id = 1")
+step("tx: update visible inside", txr and txr.rows[1][1] == 99, vim.inspect(txr and txr.rows))
+sqledit.rollback()
+vim.wait(5000, function()
+  return sqledit.status():match("%[TX%]") == nil
+end)
+_, txr = query_sync("SELECT v FROM tx_t WHERE id = 1")
+step("tx: rollback reverts", sqledit.status() == "testdb/main" and txr and txr.rows[1][1] == 10, vim.inspect(txr and txr.rows))
+
+sqledit.run("BEGIN; UPDATE tx_t SET v = 5 WHERE id = 2")
+vim.wait(5000, function()
+  return sqledit.status():match("%[TX%]") ~= nil
+end)
+step("tx: BEGIN in a script opens one", sqledit.status() == "testdb/main [TX]", sqledit.status())
+sqledit.run("SELECT v FROM tx_t ORDER BY id")
+vim.wait(5000, function()
+  return g_winbar():match("%[TX%]") ~= nil
+end)
+step("tx: grid winbar shows [TX]", g_winbar():match("%[TX%]") ~= nil, g_winbar())
+sqledit.commit()
+vim.wait(5000, function()
+  return sqledit.status():match("%[TX%]") == nil
+end)
+_, txr = query_sync("SELECT v FROM tx_t WHERE id = 2")
+step("tx: commit persists", txr and txr.rows[1][1] == 5, vim.inspect(txr and txr.rows))
+step("tx: grid winbar drops [TX]", g_winbar():match("%[TX%]") == nil, g_winbar())
+capture_notify()
+sqledit.commit()
+vim.wait(5000, function()
+  return #err_msgs > 0
+end)
+vim.notify = orig_notify
+step("tx: commit without transaction errors", last_err():match("no transaction") ~= nil, last_err())
 
 -- ------------------------------------------------------------------ switch
 local confirm_prompts = {}
@@ -451,8 +506,7 @@ grid.edit_cells()
 drain(300)
 step("multiedit: common value prefilled", input_default == "same", input_default)
 
--- --------------------------------------------------------------- column copy
--- "=column" copies another column's value row by row (SET a = b)
+-- ------------------------------------------ column copy ("=column", SET a = b)
 query_sync("UPDATE pets SET name = 'cn1', weight = 1.5 WHERE id = 1")
 query_sync("UPDATE pets SET name = 'cn2', weight = 2.5 WHERE id = 2")
 sqledit.run("SELECT id, name, weight FROM pets ORDER BY id")
@@ -732,7 +786,6 @@ step("refilter: new where applied", grid_text():match("strolch") ~= nil, grid_te
 step("refilter: prefill carries clauses", input_defaults[1] == "owner_id = 7", table.concat(input_defaults, "|"))
 
 -- ------------------------------------------------- per-buffer connections
--- a query buffer is born bound to the connection in effect; the name shows it
 sqledit.query()
 local qbuf = vim.api.nvim_get_current_buf()
 step("bind: query buffer bound", vim.b[qbuf].sqledit_conn.id == "testdb/main", vim.inspect(vim.b[qbuf].sqledit_conn))
@@ -805,9 +858,7 @@ step(
 )
 step("bind: global default untouched", sqledit.status() == "testdb/main", sqledit.status())
 
--- --------------------------------------------------------- cross-table copy
--- yank a cell block in one table (ctrl+v y), paste it onto a block in
--- another table (ctrl+v p) — per-row UPDATEs in one transaction
+-- ------------------------- cross-table copy (ctrl+v y in one grid, ctrl+v p in another)
 query_sync("UPDATE pets SET name = 'rex', weight = 12.5 WHERE id = 1")
 query_sync("UPDATE pets SET name = 'mi,a', weight = NULL WHERE id = 2")
 query_sync("DELETE FROM pets_copy")
@@ -849,8 +900,7 @@ step(
 )
 step("cellpaste: grid mirrors locally", grid_text():match("rex") ~= nil and grid_text():match("aaa") == nil, grid_text():sub(1, 80))
 
--- x: set cells to NULL without a prompt — single cell (no confirm),
--- ctrl+v block across two columns (one UPDATE, confirmed)
+-- x: single cell nulled without confirm, ctrl+v block nulled in one confirmed UPDATE
 query_sync("UPDATE pets_copy SET name = 'nx1', weight = 1 WHERE id = 10")
 query_sync("UPDATE pets_copy SET name = 'nx2', weight = 2 WHERE id = 11")
 sqledit.run("SELECT id, name, weight FROM pets_copy ORDER BY id")
@@ -940,8 +990,7 @@ step("tree: opens with both servers", #tree.state().nodes == 2, tostring(#tree.s
 step("tree: buffer name", vim.api.nvim_buf_get_name(0) == "sqledit://tree", vim.api.nvim_buf_get_name(0))
 step("tree: server label has adapter", tree_line("testdb%s+%(sqlite%)") ~= nil, tree_lines()[1])
 
--- drill into the sqlite server: database level and lone schema are skipped,
--- tables hang directly under the server
+-- sqlite drill: database level and lone schema skipped, tables directly under the server
 vim.api.nvim_win_set_cursor(twin, { tree_line("testdb"), 0 })
 tree.drill()
 vim.wait(3000, function()

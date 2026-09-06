@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,104 @@ import (
 
 type SQLiteConn struct {
 	db *sql.DB
+
+	mu sync.Mutex // one connection, one statement at a time
+	tx *sql.Conn  // session held while a transaction is open
+}
+
+type sqlQuerier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+var rollbackToRe = regexp.MustCompile(`(?i)^\s*rollback\s+(transaction\s+)?to\b`)
+
+// sqlite has no autocommit probe: transaction state follows the statements' first word.
+func opensTx(word string) bool { return word == "begin" || word == "savepoint" }
+
+func closesTx(word, sqlText string) bool {
+	switch word {
+	case "commit", "end":
+		return true
+	case "rollback":
+		return !rollbackToRe.MatchString(sqlText)
+	}
+	return false
+}
+
+func firstWord(sqlText string) string {
+	m := firstWordRe.FindStringSubmatch(sqlText)
+	if m == nil {
+		return ""
+	}
+	return strings.ToLower(m[1])
+}
+
+// session picks the querier for one statement (mu held); a BEGIN pins a dedicated connection first.
+func (c *SQLiteConn) session(ctx context.Context, sqlText string) (sqlQuerier, error) {
+	if c.tx != nil {
+		return c.tx, nil
+	}
+	if !opensTx(firstWord(sqlText)) {
+		return c.db, nil
+	}
+	conn, err := c.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.tx = conn
+	return conn, nil
+}
+
+// settle drops the session once a statement ended the transaction (mu held).
+func (c *SQLiteConn) settle(sqlText string, err error) {
+	if c.tx == nil {
+		return
+	}
+	word := firstWord(sqlText)
+	ended := err == nil && closesTx(word, sqlText)
+	if err != nil && (opensTx(word) || strings.Contains(err.Error(), "no transaction is active")) {
+		ended = true
+	}
+	if ended {
+		c.tx.Close()
+		c.tx = nil
+	}
+}
+
+func (c *SQLiteConn) InTx() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tx != nil
+}
+
+func (c *SQLiteConn) Begin(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tx != nil {
+		return ErrInTx
+	}
+	_, err := c.exec(ctx, "BEGIN", nil, 0)
+	return err
+}
+
+func (c *SQLiteConn) Commit(ctx context.Context) error {
+	return c.finish(ctx, "COMMIT")
+}
+
+func (c *SQLiteConn) Rollback(ctx context.Context) error {
+	return c.finish(ctx, "ROLLBACK")
+}
+
+func (c *SQLiteConn) finish(ctx context.Context, stmt string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tx == nil {
+		return ErrNoTx
+	}
+	_, err := c.exec(ctx, stmt, nil, 0)
+	return err
 }
 
 func SQLiteConnect(ctx context.Context, s *config.Server) (*SQLiteConn, error) {
@@ -35,15 +134,22 @@ func SQLiteConnect(ctx context.Context, s *config.Server) (*SQLiteConn, error) {
 	return &SQLiteConn{db: d}, nil
 }
 
-func (c *SQLiteConn) Close() { c.db.Close() }
+func (c *SQLiteConn) Close() {
+	c.mu.Lock()
+	if c.tx != nil {
+		c.tx.Close()
+		c.tx = nil
+	}
+	c.mu.Unlock()
+	c.db.Close()
+}
 
 var (
 	firstWordRe = regexp.MustCompile(`(?is)^\s*(?:--[^\n]*\n\s*|/\*.*?\*/\s*)*([a-z]+)`)
 	returningRe = regexp.MustCompile(`(?i)\breturning\b`)
 )
 
-// returnsRows decides Query vs Exec: database/sql needs Exec for writes to
-// report RowsAffected, but statements with RETURNING must go through Query.
+// returnsRows decides Query vs Exec: writes need Exec for RowsAffected, RETURNING needs Query.
 func returnsRows(sqlText string) bool {
 	m := firstWordRe.FindStringSubmatch(sqlText)
 	if m == nil {
@@ -57,9 +163,34 @@ func returnsRows(sqlText string) bool {
 }
 
 func (c *SQLiteConn) Query(ctx context.Context, sqlText string, params []any, maxRows int) (*Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exec(ctx, sqlText, params, maxRows)
+}
+
+func (c *SQLiteConn) Script(ctx context.Context, sqlText string, maxRows int) (*ScriptResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return runScript(ctx, sqlText, maxRows, func(ctx context.Context, sql string, maxRows int) (*Result, error) {
+		return c.exec(ctx, sql, nil, maxRows)
+	}), nil
+}
+
+// exec runs one statement on the session and tracks the transaction state (mu held).
+func (c *SQLiteConn) exec(ctx context.Context, sqlText string, params []any, maxRows int) (*Result, error) {
+	q, err := c.session(ctx, sqlText)
+	if err != nil {
+		return nil, err
+	}
+	res, err := sqliteQuery(ctx, q, sqlText, params, maxRows)
+	c.settle(sqlText, err)
+	return res, err
+}
+
+func sqliteQuery(ctx context.Context, q sqlQuerier, sqlText string, params []any, maxRows int) (*Result, error) {
 	start := time.Now()
 	if !returnsRows(sqlText) {
-		r, err := c.db.ExecContext(ctx, sqlText, params...)
+		r, err := q.ExecContext(ctx, sqlText, params...)
 		if err != nil {
 			return nil, err
 		}
@@ -72,7 +203,7 @@ func (c *SQLiteConn) Query(ctx context.Context, sqlText string, params []any, ma
 		}, nil
 	}
 
-	rows, err := c.db.QueryContext(ctx, sqlText, params...)
+	rows, err := q.QueryContext(ctx, sqlText, params...)
 	if err != nil {
 		return nil, err
 	}
@@ -120,27 +251,51 @@ func (c *SQLiteConn) Query(ctx context.Context, sqlText string, params []any, ma
 }
 
 func (c *SQLiteConn) Batch(ctx context.Context, stmts []Statement) ([]int64, error) {
-	tx, err := c.db.BeginTx(ctx, nil)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tx != nil {
+		return sqliteBatch(ctx, c.tx, stmts, "SAVEPOINT sqledit_batch", "ROLLBACK TO SAVEPOINT sqledit_batch", "RELEASE SAVEPOINT sqledit_batch")
+	}
+	conn, err := c.db.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer conn.Close()
+	return sqliteBatch(ctx, conn, stmts, "BEGIN", "ROLLBACK", "COMMIT")
+}
+
+func sqliteBatch(ctx context.Context, q sqlQuerier, stmts []Statement, begin, rollback, commit string) ([]int64, error) {
+	if _, err := q.ExecContext(ctx, begin); err != nil {
+		return nil, err
+	}
 	affected := make([]int64, len(stmts))
 	for i, st := range stmts {
-		res, err := tx.ExecContext(ctx, st.SQL, st.Params...)
+		res, err := q.ExecContext(ctx, st.SQL, st.Params...)
 		if err != nil {
+			q.ExecContext(ctx, rollback)
 			return nil, fmt.Errorf("statement %d: %w", i+1, err)
 		}
 		affected[i], _ = res.RowsAffected()
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := q.ExecContext(ctx, commit); err != nil {
+		q.ExecContext(ctx, rollback)
 		return nil, err
 	}
 	return affected, nil
 }
 
+// q is the querier for metadata calls (mu held).
+func (c *SQLiteConn) q() sqlQuerier {
+	if c.tx != nil {
+		return c.tx
+	}
+	return c.db
+}
+
 func (c *SQLiteConn) Objects(ctx context.Context) ([]Object, error) {
-	rows, err := c.db.QueryContext(ctx, `
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rows, err := c.q().QueryContext(ctx, `
 		SELECT name, type FROM sqlite_master
 		WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
 		ORDER BY type, name`)
@@ -164,7 +319,9 @@ func (c *SQLiteConn) Columns(ctx context.Context, schema, table string) ([]Colum
 	if schema != "" && schema != "main" {
 		return nil, fmt.Errorf("sqlite: unknown schema %q", schema)
 	}
-	rows, err := c.db.QueryContext(ctx,
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rows, err := c.q().QueryContext(ctx,
 		`SELECT name, type, "notnull", pk FROM pragma_table_info(?) ORDER BY cid`, table)
 	if err != nil {
 		return nil, err
@@ -198,9 +355,9 @@ func (c *SQLiteConn) Columns(ctx context.Context, schema, table string) ([]Colum
 	return cols, nil
 }
 
-// foreignKeys returns single-column FKs as from-column -> target.
+// foreignKeys returns single-column FKs as from-column -> target (mu held).
 func (c *SQLiteConn) foreignKeys(ctx context.Context, table string) (map[string]*FKRef, error) {
-	rows, err := c.db.QueryContext(ctx,
+	rows, err := c.q().QueryContext(ctx,
 		`SELECT id, "table", "from", "to" FROM pragma_foreign_key_list(?) ORDER BY id, seq`, table)
 	if err != nil {
 		return nil, err
@@ -255,7 +412,7 @@ func (c *SQLiteConn) foreignKeys(ctx context.Context, table string) (map[string]
 
 func (c *SQLiteConn) primaryKeyColumn(ctx context.Context, table string) (string, error) {
 	var name string
-	err := c.db.QueryRowContext(ctx,
+	err := c.q().QueryRowContext(ctx,
 		`SELECT name FROM pragma_table_info(?) WHERE pk = 1`, table).Scan(&name)
 	if err == sql.ErrNoRows {
 		return "", nil

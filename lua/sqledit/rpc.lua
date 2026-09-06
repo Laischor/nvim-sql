@@ -1,5 +1,4 @@
--- Manages the sqledit backend process and speaks newline-delimited
--- JSON-RPC 2.0 with it over stdin/stdout.
+-- Backend process + newline-delimited JSON-RPC 2.0 over stdin/stdout.
 local M = {}
 
 local state = {
@@ -8,6 +7,19 @@ local state = {
   pending = {}, -- id -> callback(err, result)
   buf = "",
 }
+
+-- connection id -> true while the backend reports an open transaction
+M.tx = {}
+
+---Record the `tx` flag a response carries; fires User SqleditTx on change.
+local function track_tx(conn_id, tx)
+  local open = tx == true or nil
+  if M.tx[conn_id] == open then
+    return
+  end
+  M.tx[conn_id] = open
+  vim.api.nvim_exec_autocmds("User", { pattern = "SqleditTx", data = { id = conn_id, tx = open == true } })
+end
 
 local function dispatch_line(line)
   local ok, msg = pcall(vim.json.decode, line)
@@ -49,10 +61,12 @@ local function fail_all_pending(reason)
   for _, cb in pairs(pending) do
     cb(reason, nil)
   end
+  for id in pairs(M.tx) do
+    track_tx(id, false)
+  end
 end
 
----@param opts {backend: string, config_file: string|nil}
----@return string|nil error
+---@return string|nil error; opts {backend: string, config_file: string|nil}
 function M.start(opts)
   if state.job then
     return nil
@@ -114,7 +128,17 @@ function M.request(method, params, cb)
   end
   state.next_id = state.next_id + 1
   local id = state.next_id
-  state.pending[id] = cb
+  local conn_id = type(params) == "table" and params.id or nil
+  state.pending[id] = function(err, result)
+    if conn_id then
+      if method == "disconnect" then
+        track_tx(conn_id, false)
+      elseif not err and type(result) == "table" and result.tx ~= nil then
+        track_tx(conn_id, result.tx)
+      end
+    end
+    cb(err, result)
+  end
   local payload = vim.json.encode({
     jsonrpc = "2.0",
     id = id,

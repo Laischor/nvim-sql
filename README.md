@@ -74,8 +74,22 @@ editing instead of a re-implementation.
 - **Query history** — `:Sqledit history` fuzzy-picks from this
   connection's past queries (persisted across sessions) and opens the
   pick in a query buffer — it never executes directly.
+- **Multi-statement runs** — a buffer with several `;`-separated
+  statements runs them in order (strings, comments, `$$` bodies and
+  `CREATE TRIGGER … BEGIN … END` are split correctly). The grid shows the
+  last result set; the winbar summarizes the rest (`3 statements: 2
+  affected · 1 affected · 42 row(s)`). On an error the run stops there,
+  the message names the statement, and what ran before is still shown.
+  `r` re-runs the shown statement only.
+- **Transactions** — `:Sqledit begin`, then run and edit as usual (cell
+  edits, deletes, pastes included — everything on that connection), look
+  at the result, `:Sqledit commit` or `:Sqledit rollback`. A `BEGIN;`
+  typed into a query works the same way. The statusline and grid winbar
+  show `[TX]` while one is open; disconnecting rolls it back. On prod,
+  commit asks first.
 - **Prod guard** — servers marked `prod = true` get a warning tag and a
-  confirm prompt before any write statement, including cell edits.
+  confirm prompt before any write statement, including cell edits, and
+  before committing a transaction.
 - **Go backend** — `pgx`/`modernc.org/sqlite` over JSON-RPC, no `psql`
   text-scraping.
 
@@ -158,13 +172,16 @@ Password resolution order: `password` (inline, avoid), `password_env`,
 | `:Sqledit filter` | like `tables`, plus prompts for `WHERE` / `ORDER BY` |
 | `:Sqledit refilter` | re-edit the last filter's clauses (prefilled), re-run |
 | `:Sqledit query` | open a scratch SQL buffer pinned to the connection (run: `<localleader>r`) |
-| `:Sqledit run [sql]` | run argument, visual range, or current buffer |
+| `:Sqledit run [sql]` | run argument, visual range, or current buffer (several statements allowed) |
+| `:Sqledit begin` / `commit` / `rollback` | transaction on the buffer's connection; `[TX]` in statusline while open |
 | `:Sqledit history` | pick a past query → opens in a query buffer |
 | `:Sqledit refresh` | clear schema cache (completion re-introspects) |
 | `:Sqledit disconnect` | drop the buffer's connection (unpins its buffers) |
 
-Statusline: `require("sqledit").status()` → `"site3-prod/app [PROD]"`
-(buffer-aware: pinned query buffers show their own connection).
+Statusline: `require("sqledit").status()` → `"site3-prod/app [PROD] [TX]"`
+(buffer-aware: pinned query buffers show their own connection; `[TX]`
+while a transaction is open — the `User SqleditTx` autocmd fires on
+change).
 
 ### Completion (blink.cmp)
 
@@ -202,10 +219,6 @@ the current column (`col 4/23: created_at (timestamptz)`) plus the
 result status.
 
 `:checkhealth sqledit` verifies backend binary and config.
-
-## Roadmap
-
-- multi-statement support for postgres (single statement per run for now)
 
 ## Development
 

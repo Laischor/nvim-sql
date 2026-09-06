@@ -6,8 +6,7 @@ local M = {}
 M.config = {
   -- Path to the sqledit backend binary. Defaults to <plugin>/bin/sqledit.
   backend = nil,
-  -- Path to connections.toml. Defaults to the backend's default
-  -- ($SQLEDIT_CONFIG or ~/.config/sqledit/connections.toml).
+  -- Path to connections.toml ($SQLEDIT_CONFIG or ~/.config/sqledit/connections.toml).
   connections_file = nil,
   -- Max rows fetched per query.
   max_rows = 500,
@@ -29,8 +28,7 @@ local function notify_err(msg)
   vim.notify("sqledit: " .. msg, vim.log.levels.ERROR)
 end
 
----A notified error lingers in the message area with nothing to displace it
----on success — clear it so a clean run doesn't look failed.
+---Clear a lingering notified error so a clean run doesn't look failed.
 local function clear_error()
   if state.error_shown then
     state.error_shown = false
@@ -42,8 +40,7 @@ local function is_query_buf(buf)
   return vim.api.nvim_buf_get_name(buf):match("^sqledit://query%-") ~= nil
 end
 
----Bind a query buffer to a connection (nil unbinds) and reflect it in the
----buffer name: sqledit://query-3@site3/analytics.
+---Bind a query buffer to a connection (nil unbinds); name becomes sqledit://query-3@site3/analytics.
 local function bind_buffer(buf, info)
   vim.b[buf].sqledit_conn = info
   local old = vim.api.nvim_buf_get_name(buf)
@@ -69,8 +66,7 @@ local function effective_conn(buf)
   return vim.b[buf].sqledit_conn or state.current
 end
 
----Make `info` the connection to use from here on: global default, plus the
----current query buffer's binding when we're in one.
+---Make `info` the global default and, inside a query buffer, its binding.
 local function adopt_conn(info, on_done)
   state.current = info
   if is_query_buf(0) then
@@ -105,8 +101,7 @@ end
 
 local blink_registered = false
 
----Register the completion source with blink.cmp, if installed. No-op when
----the user already configured a "sqledit" provider manually.
+---Register the blink.cmp source; no-op without blink or with a manual "sqledit" provider.
 local function register_blink()
   if blink_registered then
     return
@@ -130,6 +125,13 @@ function M.setup(opts)
     group = vim.api.nvim_create_augroup("sqledit_blink", { clear = true }),
     callback = register_blink,
   })
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "SqleditTx",
+    group = vim.api.nvim_create_augroup("sqledit_tx", { clear = true }),
+    callback = function()
+      vim.cmd.redrawstatus()
+    end,
+  })
 end
 
 ---For :checkhealth.
@@ -137,9 +139,7 @@ function M.blink_registered()
   return blink_registered
 end
 
----Connection info ({id, server, database, adapter, prod, readonly}) the
----current buffer runs against — its binding, else the global one — or nil.
----Used by completion sources.
+---@return table|nil connInfo the current buffer runs against (binding, else global).
 function M.current()
   return effective_conn(0)
 end
@@ -150,14 +150,13 @@ function M.refresh()
   vim.notify("sqledit: schema cache cleared")
 end
 
----Connection label for the statusline, e.g. "site3/analytics [PROD]".
----Buffer-aware: a bound query buffer shows its own connection.
+---@return string statusline label, e.g. "site3/analytics [PROD] [TX]" (buffer-aware).
 function M.status()
   local c = effective_conn(0)
   if not c then
     return ""
   end
-  return c.id .. (c.prod and " [PROD]" or "")
+  return c.id .. (c.prod and " [PROD]" or "") .. (rpc.tx[c.id] and " [TX]" or "")
 end
 
 local WRITE_RE = vim.regex([[\v<(insert|update|delete|drop|alter|truncate|create|grant|revoke|vacuum|reindex)>]])
@@ -170,8 +169,7 @@ local function quote_ident(name)
   return '"' .. name:gsub('"', '""') .. '"'
 end
 
----Detect a plain single-table SELECT so the grid can offer cell editing.
----Conservative: any join/group/union/distinct or a second FROM disables it.
+---@return {schema, table_}|nil for a plain single-table SELECT (editable grid).
 local function detect_source(sql)
   local s = sql:lower()
   if not s:match("^%s*select%f[%W]") then
@@ -204,8 +202,30 @@ local function detect_source(sql)
   return { schema = schema, table_ = tbl }
 end
 
----Run SQL and show the result grid. `conn` pins the connection; without it
----the current buffer's binding is used, falling back to the global one.
+---The grid shows one result: the last one with columns, else the last one.
+local function pick_shown(results)
+  for i = #results, 1, -1 do
+    if #(results[i].columns or {}) > 0 then
+      return results[i]
+    end
+  end
+  return results[#results]
+end
+
+---One line for the winbar: "3 statements: 1 row(s) affected · 2 row(s) affected · 5 row(s)".
+local function summarize(results)
+  local parts = {}
+  for _, r in ipairs(results) do
+    if #(r.columns or {}) > 0 then
+      table.insert(parts, ("%d row(s)"):format(r.row_count or 0))
+    else
+      table.insert(parts, ("%d affected"):format(r.rows_affected or 0))
+    end
+  end
+  return ("%d statements: %s"):format(#results, table.concat(parts, " · "))
+end
+
+---Run one or more statements and show the last result set; `conn` pins the connection (default: buffer binding, then global).
 function M.run(sql, conn)
   if not ensure_backend() then
     return
@@ -227,24 +247,76 @@ function M.run(sql, conn)
     end
   end
   state.last_sql = sql
-  rpc.request("query", { id = c.id, sql = sql, max_rows = M.config.max_rows }, function(err, result)
+  rpc.request("script", { id = c.id, sql = sql, max_rows = M.config.max_rows }, function(err, res)
+    if err then
+      notify_err(err)
+      return
+    end
+    require("sqledit.history").add(c.id, sql)
+    local results = res.results or {}
+    if res.failed then
+      local where = #results > 0 and ("statement %d (%d ran)"):format(res.failed.index, #results) or "statement 1"
+      notify_err(("%s: %s"):format(where, res.failed.message))
+    else
+      clear_error()
+    end
+    local shown = pick_shown(results)
+    if not shown then
+      return
+    end
+    grid.render(shown, {
+      conn = c.id,
+      adapter = c.adapter,
+      prod = c.prod,
+      sql = shown.sql,
+      source = detect_source(shown.sql),
+      summary = #results > 1 and summarize(results) or nil,
+      rerun = function()
+        M.run(shown.sql, c)
+      end,
+    })
+  end)
+end
+
+---begin / commit / rollback on the connection in effect; commit on prod confirms.
+local function tx_command(method)
+  if not ensure_backend() then
+    return
+  end
+  local c = effective_conn(0)
+  if not c then
+    notify_err("no connection — :Sqledit connect first")
+    return
+  end
+  if method == "commit" and M.config.confirm_prod_writes and c.prod then
+    if vim.fn.confirm(("Commit transaction on PROD (%s)?"):format(c.id), "&Yes\n&No", 2, "Warning") ~= 1 then
+      return
+    end
+  end
+  rpc.request(method, { id = c.id }, function(err, res)
     if err then
       notify_err(err)
       return
     end
     clear_error()
-    require("sqledit.history").add(c.id, sql)
-    grid.render(result, {
-      conn = c.id,
-      adapter = c.adapter,
-      prod = c.prod,
-      sql = sql,
-      source = detect_source(sql),
-      rerun = function()
-        M.run(sql, c)
-      end,
-    })
+    if res.message then
+      vim.notify("sqledit: " .. res.message, vim.log.levels.WARN)
+    else
+      vim.notify(("sqledit: %s on %s"):format(method == "begin" and "transaction opened" or method, c.id))
+    end
   end)
+end
+
+function M.begin()
+  tx_command("begin")
+end
+
+function M.commit()
+  tx_command("commit")
+end
+
+function M.rollback()
+  tx_command("rollback")
 end
 
 local function connect_to(server_name, database, on_done)
@@ -280,9 +352,7 @@ local function pick_database(server, on_done)
   end)
 end
 
----Pick a connection. Already-open connections come first and are adopted
----directly (no database picker); configured servers follow and go through
----the server → database flow. `on_done(info)` is optional.
+---Pick a connection: open ones first (adopted directly), then servers via server → database.
 function M.connect(on_done)
   if not ensure_backend() then
     return
@@ -339,9 +409,7 @@ function M.connect(on_done)
   end)
 end
 
----Adopt an already-open connection (a connInfo) as the one to use from
----here on — global default plus the current query buffer's binding. Used
----by the tree view.
+---Adopt an open connection (connInfo) as global default + current query buffer binding.
 function M.use_connection(info)
   adopt_conn(info)
 end
@@ -354,9 +422,7 @@ function M.tree()
   require("sqledit.tree").toggle()
 end
 
----Switch connection, then offer to re-run the last query there — same
----table, different site/env. Never runs anything silently: read-only
----queries need a confirm (with preview), writes are never offered.
+---Switch connection, then offer (confirmed) to re-run the last read-only query there.
 function M.switch()
   local sql = state.last_sql
   M.connect(function(info)
@@ -381,8 +447,7 @@ function M.switch()
   end)
 end
 
----Ask for optional WHERE / ORDER BY clauses (prefilled from `defaults`),
----then hand back suffix + the raw clauses.
+---Prompt WHERE / ORDER BY (prefilled from `defaults`), cb(suffix, where, order).
 local function input_clauses(defaults, cb)
   vim.ui.input({ prompt = "WHERE (empty: none): ", default = defaults.where }, function(where)
     if where == nil then -- cancelled
@@ -405,8 +470,7 @@ local function input_clauses(defaults, cb)
   end)
 end
 
----Fuzzy-pick a table/view across all schemas, then SELECT it.
----opts.clauses: also prompt for WHERE / ORDER BY.
+---Fuzzy-pick a table/view, then SELECT it; opts.clauses also prompts WHERE / ORDER BY.
 function M.tables(opts)
   opts = opts or {}
   if not ensure_backend() then
@@ -457,8 +521,7 @@ function M.filter()
   M.tables({ clauses = true })
 end
 
----Re-edit the clauses of the last :Sqledit filter (prefilled) and re-run
----on the same table.
+---Re-edit the last filter's clauses (prefilled) and re-run on the same table.
 function M.refilter()
   local f = state.last_filter
   if not f then
@@ -471,9 +534,7 @@ function M.refilter()
   end)
 end
 
----Open a scratch SQL buffer, optionally prefilled. The buffer is bound to
----the connection in effect here (a bound buffer passes its binding on);
----the binding shows in the buffer name and survives later switches.
+---Open a scratch SQL buffer (optionally prefilled) bound to the connection in effect.
 function M.query(initial)
   state.query_count = state.query_count + 1
   local conn = effective_conn(0)
@@ -489,8 +550,7 @@ function M.query(initial)
   if initial then
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(initial, "\n", { plain = true }))
   end
-  -- never swallow a grid/header window: hop to the previous window, or
-  -- make a new split when everything visible belongs to sqledit
+  -- never swallow a grid/header window
   if vim.api.nvim_buf_get_name(0):match("^sqledit://") then
     vim.cmd("wincmd p")
     if vim.api.nvim_buf_get_name(0):match("^sqledit://") then
@@ -503,8 +563,7 @@ function M.query(initial)
   end, { buffer = buf, desc = "sqledit: run query" })
 end
 
----Pick a query from this connection's history; opens it in a query
----buffer (never runs it directly).
+---Pick a query from this connection's history into a query buffer (never runs it).
 function M.history()
   local c = effective_conn(0)
   if not c then
@@ -553,8 +612,7 @@ function M.run_range(line1, line2)
   M.run(table.concat(lines, "\n"))
 end
 
----Disconnect the connection in effect for the current buffer. Clears the
----global default when it matches and unbinds every buffer bound to it.
+---Disconnect the buffer's connection; clears a matching global default, unbinds its buffers.
 function M.disconnect()
   local c = effective_conn(0)
   if not c then

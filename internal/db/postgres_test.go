@@ -10,8 +10,7 @@ import (
 	"github.com/Laischor/nvim-sql/internal/config"
 )
 
-// pgServer builds a config.Server from $SQLEDIT_TEST_PG
-// (postgres://user:pass@host:port/db). Tests skip when unset.
+// pgServer builds a config.Server from $SQLEDIT_TEST_PG (postgres://user:pass@host:port/db); skips when unset.
 func pgServer(t *testing.T) *config.Server {
 	t.Helper()
 	dsn := os.Getenv("SQLEDIT_TEST_PG")
@@ -130,5 +129,88 @@ func TestPGEndToEnd(t *testing.T) {
 	}
 	if cols[0].FK != nil || cols[1].FK != nil {
 		t.Fatalf("unexpected fk: %+v", cols)
+	}
+
+	name := func() string {
+		t.Helper()
+		r, err := conn.Query(ctx, "SELECT name FROM sqledit_t.dogs WHERE id = 1", nil, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Rows[0][0].(string)
+	}
+
+	// script: several statements, last one a SELECT
+	sr, err := conn.Script(ctx, `
+		UPDATE sqledit_t.dogs SET name = 'rex' WHERE id = 1;
+		SELECT name FROM sqledit_t.dogs WHERE id = 1; -- check`, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Results) != 2 || sr.Failed != nil || sr.Results[0].RowsAffected != 1 || sr.Results[1].Rows[0][0] != "rex" {
+		t.Fatalf("script: %+v", sr)
+	}
+	if conn.InTx() {
+		t.Fatal("script without BEGIN left a transaction open")
+	}
+
+	// begin / rollback keeps the session across calls
+	if err := conn.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Begin(ctx); err != ErrInTx {
+		t.Fatalf("second begin: %v", err)
+	}
+	if _, err := conn.Query(ctx, "UPDATE sqledit_t.dogs SET name = 'tx' WHERE id = 1", nil, 10); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.InTx() || name() != "tx" {
+		t.Fatalf("in tx: %v %q", conn.InTx(), name())
+	}
+	if err := conn.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if conn.InTx() || name() != "rex" {
+		t.Fatalf("after rollback: %v %q", conn.InTx(), name())
+	}
+	if err := conn.Commit(ctx); err != ErrNoTx {
+		t.Fatalf("commit without tx: %v", err)
+	}
+
+	// failed statement aborts the pg transaction: commit reports the rollback
+	if err := conn.Begin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	conn.Query(ctx, "UPDATE sqledit_t.dogs SET name = 'lost' WHERE id = 1", nil, 10)
+	if _, err := conn.Query(ctx, "SELECT * FROM sqledit_t.nope", nil, 10); err == nil {
+		t.Fatal("expected error")
+	}
+	err = conn.Commit(ctx)
+	if _, ok := err.(TxWarning); !ok {
+		t.Fatalf("commit after abort: %v", err)
+	}
+	if conn.InTx() || name() != "rex" {
+		t.Fatalf("after aborted commit: %v %q", conn.InTx(), name())
+	}
+
+	// BEGIN inside a script pins the session; batch inside uses a savepoint
+	sr, err = conn.Script(ctx, "BEGIN; UPDATE sqledit_t.dogs SET name = 'script' WHERE id = 1", 10)
+	if err != nil || sr.Failed != nil || !conn.InTx() {
+		t.Fatalf("script begin: %v %+v", err, sr)
+	}
+	if _, err := conn.Batch(ctx, []Statement{
+		{SQL: "UPDATE sqledit_t.dogs SET name = $1 WHERE id = $2", Params: []any{"x", "1"}},
+		{SQL: "UPDATE sqledit_t.nope SET x = 1"},
+	}); err == nil {
+		t.Fatal("batch: expected error")
+	}
+	if name() != "script" {
+		t.Fatalf("savepoint rollback: %q", name())
+	}
+	if err := conn.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if conn.InTx() || name() != "script" {
+		t.Fatalf("after commit: %v %q", conn.InTx(), name())
 	}
 }

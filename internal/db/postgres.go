@@ -6,9 +6,11 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Laischor/nvim-sql/internal/config"
@@ -16,6 +18,101 @@ import (
 
 type PGConn struct {
 	pool *pgxpool.Pool
+
+	mu sync.Mutex
+	tx *pgxpool.Conn // session held while a transaction is open
+}
+
+type pgQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func pgInTx(conn *pgxpool.Conn) bool {
+	return conn.Conn().PgConn().TxStatus() != 'I'
+}
+
+// acquire hands out the transaction session (serialized) or a fresh pool connection; release must follow.
+func (c *PGConn) acquire(ctx context.Context) (*pgxpool.Conn, func(), error) {
+	c.mu.Lock()
+	if c.tx != nil {
+		return c.tx, c.releaseSession, nil
+	}
+	c.mu.Unlock()
+	conn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, func() { c.releaseFresh(conn) }, nil
+}
+
+func (c *PGConn) releaseSession() {
+	if !pgInTx(c.tx) {
+		c.tx.Release()
+		c.tx = nil
+	}
+	c.mu.Unlock()
+}
+
+// releaseFresh keeps the connection as session when a statement opened a transaction on it.
+func (c *PGConn) releaseFresh(conn *pgxpool.Conn) {
+	if !pgInTx(conn) {
+		conn.Release()
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tx != nil {
+		conn.Release() // pool destroys a connection mid-transaction: implicit rollback
+		return
+	}
+	c.tx = conn
+}
+
+func (c *PGConn) InTx() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tx != nil
+}
+
+func (c *PGConn) Begin(ctx context.Context) error {
+	conn, release, err := c.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if pgInTx(conn) {
+		return ErrInTx
+	}
+	_, err = conn.Exec(ctx, "BEGIN")
+	return err
+}
+
+func (c *PGConn) Commit(ctx context.Context) error {
+	return c.finish(ctx, "COMMIT")
+}
+
+func (c *PGConn) Rollback(ctx context.Context) error {
+	return c.finish(ctx, "ROLLBACK")
+}
+
+func (c *PGConn) finish(ctx context.Context, stmt string) error {
+	conn, release, err := c.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if !pgInTx(conn) {
+		return ErrNoTx
+	}
+	tag, err := conn.Exec(ctx, stmt)
+	if err != nil {
+		return err
+	}
+	if stmt == "COMMIT" && tag.String() == "ROLLBACK" {
+		return TxWarning("transaction was aborted by an earlier error — rolled back instead")
+	}
+	return nil
 }
 
 func pgConnString(s *config.Server, database string) (string, error) {
@@ -49,8 +146,7 @@ func pgConnString(s *config.Server, database string) (string, error) {
 	return u.String(), nil
 }
 
-// PGListDatabases connects to the server's maintenance database and lists
-// all connectable databases — so ad-hoc copies show up without config changes.
+// PGListDatabases lists connectable databases via the maintenance database.
 func PGListDatabases(ctx context.Context, s *config.Server) ([]string, error) {
 	connStr, err := pgConnString(s, s.Database)
 	if err != nil {
@@ -94,11 +190,39 @@ func PGConnect(ctx context.Context, s *config.Server, database string) (*PGConn,
 	return &PGConn{pool: pool}, nil
 }
 
-func (c *PGConn) Close() { c.pool.Close() }
+func (c *PGConn) Close() {
+	c.mu.Lock()
+	if c.tx != nil {
+		c.tx.Release()
+		c.tx = nil
+	}
+	c.mu.Unlock()
+	c.pool.Close()
+}
 
 func (c *PGConn) Query(ctx context.Context, sqlText string, params []any, maxRows int) (*Result, error) {
+	conn, release, err := c.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return pgQuery(ctx, conn, sqlText, params, maxRows)
+}
+
+func (c *PGConn) Script(ctx context.Context, sqlText string, maxRows int) (*ScriptResult, error) {
+	conn, release, err := c.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return runScript(ctx, sqlText, maxRows, func(ctx context.Context, sql string, maxRows int) (*Result, error) {
+		return pgQuery(ctx, conn, sql, nil, maxRows)
+	}), nil
+}
+
+func pgQuery(ctx context.Context, q pgQuerier, sqlText string, params []any, maxRows int) (*Result, error) {
 	start := time.Now()
-	rows, err := c.pool.Query(ctx, sqlText, params...)
+	rows, err := q.Query(ctx, sqlText, params...)
 	if err != nil {
 		return nil, err
 	}
@@ -143,27 +267,41 @@ func (c *PGConn) Query(ctx context.Context, sqlText string, params []any, maxRow
 }
 
 func (c *PGConn) Batch(ctx context.Context, stmts []Statement) ([]int64, error) {
-	tx, err := c.pool.Begin(ctx)
+	conn, release, err := c.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer release()
+	begin, rollback, commit := "BEGIN", "ROLLBACK", "COMMIT"
+	if pgInTx(conn) {
+		begin, rollback, commit = "SAVEPOINT sqledit_batch", "ROLLBACK TO SAVEPOINT sqledit_batch", "RELEASE SAVEPOINT sqledit_batch"
+	}
+	if _, err := conn.Exec(ctx, begin); err != nil {
+		return nil, err
+	}
 	affected := make([]int64, len(stmts))
 	for i, st := range stmts {
-		tag, err := tx.Exec(ctx, st.SQL, st.Params...)
+		tag, err := conn.Exec(ctx, st.SQL, st.Params...)
 		if err != nil {
+			conn.Exec(ctx, rollback)
 			return nil, fmt.Errorf("statement %d: %w", i+1, err)
 		}
 		affected[i] = tag.RowsAffected()
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if _, err := conn.Exec(ctx, commit); err != nil {
+		conn.Exec(ctx, rollback)
 		return nil, err
 	}
 	return affected, nil
 }
 
 func (c *PGConn) Objects(ctx context.Context) ([]Object, error) {
-	rows, err := c.pool.Query(ctx, `
+	conn, release, err := c.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	rows, err := conn.Query(ctx, `
 		SELECT n.nspname, c.relname,
 		       CASE c.relkind
 		         WHEN 'r' THEN 'table' WHEN 'p' THEN 'table'
@@ -183,7 +321,12 @@ func (c *PGConn) Objects(ctx context.Context) ([]Object, error) {
 }
 
 func (c *PGConn) Columns(ctx context.Context, schema, table string) ([]Column, error) {
-	rows, err := c.pool.Query(ctx, `
+	conn, release, err := c.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	rows, err := conn.Query(ctx, `
 		SELECT a.attname,
 		       pg_catalog.format_type(a.atttypid, a.atttypmod),
 		       a.attnotnull,
@@ -205,7 +348,7 @@ func (c *PGConn) Columns(ctx context.Context, schema, table string) ([]Column, e
 	}
 
 	// single-column foreign keys (composite FKs have no obvious cell to jump from)
-	fkRows, err := c.pool.Query(ctx, `
+	fkRows, err := conn.Query(ctx, `
 		SELECT a.attname, fn.nspname, fc.relname, fa.attname
 		FROM pg_constraint ct
 		JOIN pg_class c ON c.oid = ct.conrelid

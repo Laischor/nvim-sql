@@ -1,10 +1,4 @@
--- Renders a query result as an aligned grid buffer.
---
--- Editing: `c` on a cell opens an input and writes the change back as
--- `UPDATE … WHERE <pk>` (parameterized, never string-concatenated).
--- A result is editable only when it came from a single-table SELECT and
--- all primary-key columns of that table are present in the result.
--- `r` re-runs the query, `q` closes the window.
+-- Aligned result grid; editable (parameterized UPDATE … WHERE <pk>) for single-table SELECTs with the pk present.
 local rpc = require("sqledit.rpc")
 
 local M = {}
@@ -16,15 +10,14 @@ local state = {
   header_win = nil,
   status_text = nil, -- shown in the data window's winbar
   result = nil,
-  meta = nil, -- {conn, adapter, prod, sql, source = {schema, table_}|nil, rerun}
+  meta = nil, -- {conn, adapter, prod, sql, source = {schema, table_}|nil, summary|nil, rerun}
   ranges = nil, -- per data row: per column {byte_start, byte_stop}
   table_columns = nil, -- columns meta of meta.source, once fetched
 }
 
 local MAX_CELL_WIDTH = 60
 
--- Cell block yanked with visual `y`, for pasting into another grid as
--- per-row UPDATEs. Survives re-renders and connection switches.
+-- Cell block from visual `y`; survives re-renders and connection switches.
 local cell_clip = nil -- {columns = {names}, rows = {{v, ...}}, from = "label"}
 
 local function notify_err(msg)
@@ -154,9 +147,17 @@ local function ensure_buffers()
   vim.keymap.set("x", "x", function()
     M.null_cells()
   end, { buffer = state.buf, nowait = true, desc = "sqledit: set selected cells to NULL" })
+  local group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true })
   vim.api.nvim_create_autocmd("CursorMoved", {
-    group = vim.api.nvim_create_augroup("sqledit_grid_cursor", { clear = true }),
+    group = group,
     buffer = state.buf,
+    callback = function()
+      M.update_winbar()
+    end,
+  })
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "SqleditTx",
     callback = function()
       M.update_winbar()
     end,
@@ -180,9 +181,7 @@ local function sync_header_scroll()
 end
 
 function M.close()
-  -- header first, so a potential last-window fallback lands in the data
-  -- window; E444 (cannot close last window) turns into "show an empty
-  -- buffer instead"
+  -- header first; E444 on the last window becomes "show an empty buffer"
   for _, win in ipairs({ state.header_win, state.win }) do
     if win and vim.api.nvim_win_is_valid(win) and not pcall(vim.api.nvim_win_close, win, false) then
       vim.api.nvim_win_set_buf(win, vim.api.nvim_create_buf(true, false))
@@ -244,8 +243,7 @@ local function ensure_windows()
     end,
     once = true,
   })
-  -- the header is display-only: entering it passes the movement through
-  -- (from the grid upwards, from anywhere else into the grid)
+  -- header is display-only: window movement passes through it
   vim.api.nvim_create_autocmd("WinEnter", {
     group = group,
     buffer = state.header_buf,
@@ -298,12 +296,13 @@ local function redraw()
   for i, col in ipairs(cols) do
     header[i] = pad(col.name, widths[i], false)
   end
-  state.status_text = ("%s%s  •  %d row(s)%s  •  %dms%s"):format(
+  state.status_text = ("%s%s  •  %d row(s)%s  •  %dms%s%s"):format(
     meta.conn,
     meta.prod and "  [PROD]" or "",
     result.row_count or #rows,
     result.more and " (truncated, raise max_rows)" or "",
     result.duration_ms or 0,
+    meta.summary and ("  •  " .. meta.summary) or "",
     meta.source and "  •  c:edit gd:fk r:rerun" or ""
   )
 
@@ -342,8 +341,7 @@ local function redraw()
   M.update_winbar()
 end
 
----@param result table backend query result
----@param meta {conn: string, adapter: string, prod: boolean, sql: string, source: table|nil, rerun: function|nil}
+---@param meta {conn: string, adapter: string, prod: boolean, sql: string, source: table|nil, summary: string|nil, rerun: function|nil}
 function M.render(result, meta)
   state.result = result
   state.meta = meta
@@ -354,8 +352,7 @@ function M.render(result, meta)
   end
 end
 
----Column index for a 1-based byte position, from the (shared) column
----alignment of the first data row. nil without rows.
+---@return integer|nil column index for a 1-based byte position (nil without rows).
 local function column_at(byte_col)
   local ranges = state.ranges and state.ranges[1]
   if not ranges then
@@ -418,13 +415,12 @@ function M.pick_column()
   end)
 end
 
----Winbar carries the status line plus, in wide tables, where you are:
----column n/total, name, type.
+---Winbar: status line plus current column n/total, name, type.
 function M.update_winbar()
   if not (state.win and vim.api.nvim_win_is_valid(state.win) and state.result) then
     return
   end
-  local text = state.status_text or ""
+  local text = (rpc.tx[state.meta.conn] and "[TX]  •  " or "") .. (state.status_text or "")
   local i = M.current_column()
   if i then
     local col = state.result.columns[i]
@@ -487,8 +483,7 @@ local function get_table_columns(cb)
   end)
 end
 
----Input prefill / param serialization: cells edit as text, literal NULL
----means SQL NULL.
+---@return string cell as input text; NULL for SQL NULL.
 local function to_input(v)
   if v == nil or v == vim.NIL then
     return "NULL"
@@ -503,9 +498,7 @@ local function placeholder(n)
   return state.meta.adapter == "postgres" and ("$" .. n) or "?"
 end
 
----One pk-condition group per row, OR-joined — handles composite pks and
----NULL pk values without row-value syntax. Appends pk values to params.
----Returns the groups, or nil + error message.
+---@return string[]|nil pk condition groups (one per row, appends params), or nil + error.
 local function build_pk_where(table_cols, rows, params)
   local src = state.meta.source
   local result = state.result
@@ -540,11 +533,7 @@ local function build_pk_where(table_cols, rows, params)
   return groups
 end
 
----Write `input` into column `col` of the given row indices via one
----parameterized UPDATE. Input semantics: "NULL" = SQL NULL, '' = empty
----string, empty input = no change, "=other_column" = copy that column's
----value row by row (SET col = other_column, evaluated by the server —
----each row gets its own value).
+---One UPDATE of `col` for the rows; "NULL" = SQL NULL, '' = empty, "" = no change, "=other" = SET col = other.
 local function apply_update(rows, col, input)
   local src = state.meta.source
   local result = state.result
@@ -669,8 +658,7 @@ local function apply_update(rows, col, input)
   end)
 end
 
----SQL literal for a cell value in an equality comparison. Values come
----from the database itself; strings are quoted with '' doubling.
+---@return string SQL literal for a cell value ('' doubling for strings).
 local function sql_literal(v)
   if type(v) == "number" then
     return tostring(v)
@@ -678,8 +666,7 @@ local function sql_literal(v)
   return "'" .. tostring(v):gsub("'", "''") .. "'"
 end
 
----Follow the foreign key of the cell under the cursor: opens the
----referenced row in the grid (read-only SELECT).
+---Follow the cell's foreign key: SELECT the referenced row into the grid.
 function M.fk_jump()
   if not (state.result and state.meta) then
     return
@@ -725,8 +712,7 @@ function M.fk_jump()
   end)
 end
 
----Shared entry for single- and multi-row edits: validates the column,
----prefills the input (common value across rows, empty when mixed).
+---Single/multi-row edit entry: validates the column, prefills the common value.
 local function start_edit(rows, col)
   get_table_columns(function(table_cols)
     local col_name = state.result.columns[col].name
@@ -742,8 +728,7 @@ local function start_edit(rows, col)
         col_name, state.meta.source.schema, state.meta.source.table_))
       return
     end
-    -- NULL prefills empty (no need to delete "NULL" before typing);
-    -- setting NULL is done by typing the literal NULL
+    -- NULL prefills empty; typing NULL sets NULL
     local function prefill_text(v)
       if v == nil or v == vim.NIL then
         return ""
@@ -779,8 +764,7 @@ local function editable_or_complain()
   return true
 end
 
----Row indices for the current action: visual selection when active
----(leaves visual mode), else the cursor row.
+---@return integer[] row indices: visual selection (leaves visual mode) or cursor row.
 local function selected_rows()
   local total = #state.result.rows
   if total == 0 then
@@ -805,9 +789,7 @@ local function selected_rows()
   return { pos[1] }
 end
 
----Visual selection as rows plus the spanned column range (from the
----selection's corner columns; linewise selections span all columns).
----Leaves visual mode.
+---@return integer[], integer, integer rows, first/last column of the visual block (leaves visual mode).
 local function selected_block()
   local rows = selected_rows()
   if not rows then
@@ -824,8 +806,7 @@ local function selected_block()
   return rows, c1, c2
 end
 
----Yank rows as csv/json/insert into the unnamed register and, when
----available, the system clipboard.
+---Yank rows as csv/json/insert into the unnamed register + system clipboard.
 function M.yank(fmt)
   if not state.result then
     return
@@ -866,8 +847,7 @@ function M.yank(fmt)
   end
 end
 
----Insert rows from the register (CSV or JSON, auto-detected) into the
----grid's source table on the CURRENT connection, then re-run the query.
+---Insert register rows (CSV/JSON) into the grid's table on the current connection, then re-run.
 function M.paste()
   if not editable_or_complain() then
     return
@@ -886,8 +866,7 @@ function M.paste()
     return
   end
   get_table_columns(function(table_cols)
-    -- match by exact name, falling back to case-insensitive (postgres
-    -- folds unquoted identifiers; external CSV headers vary)
+    -- exact name first, then case-insensitive
     local known, known_ci = {}, {}
     for _, c in ipairs(table_cols) do
       known[c.name] = c.name
@@ -998,11 +977,7 @@ function M.paste()
   end)
 end
 
----Yank the visually selected cell block (rows × columns). Meant for
----copying data between tables: paste it onto a block in another grid
----(visual `p`) as per-row UPDATEs. A TSV copy goes into the unnamed
----register and the system clipboard, so the block also pastes as text
----into any buffer. Works in any grid, joins included.
+---Yank the visual cell block for visual `p` in another grid; TSV copy to register + clipboard.
 function M.yank_cells()
   if not (state.result and #(state.result.rows or {}) > 0) then
     return
@@ -1038,9 +1013,7 @@ function M.yank_cells()
   vim.notify(("sqledit: yanked %d×%d cell block (visual p in a grid pastes it as UPDATEs)"):format(#rows, #cols))
 end
 
----Yank the full content of the cell under the cursor into register +
----clipboard. The grid display truncates long values ("…"); the register
----gets the real thing, newlines included. NULL yanks as literal NULL.
+---Yank the untruncated cell content into register + clipboard (NULL as literal NULL).
 function M.yank_cell()
   if not (state.result and #(state.result.rows or {}) > 0) then
     return
@@ -1064,10 +1037,7 @@ function M.yank_cell()
   vim.notify(("sqledit: yanked %s (%d chars)"):format(state.result.columns[col].name, #text))
 end
 
----Paste the yanked cell block onto the visually selected block: one
----parameterized UPDATE per row, all in a single transaction (rolled
----back entirely on any failure). Rows and columns are matched by
----position, so the selection must have the yanked block's shape.
+---Paste the yanked block onto a same-shaped visual block: one UPDATE per row, one transaction.
 function M.paste_cells()
   if not editable_or_complain() then
     return
@@ -1244,11 +1214,7 @@ function M.delete_rows()
   end)
 end
 
----Open an insert form in a float: one line per column, the line text is
----the value (column labels are virtual and can't be mangled). :w or
----<CR> (normal mode) runs the INSERT, <Tab>/<S-Tab> hop between fields.
----Empty value = column omitted (DB default / serial pk), literal NULL
----= SQL NULL, '' = empty string.
+---Insert form float, one line per column; :w/<CR> runs it. Empty = omitted, NULL = SQL NULL, '' = empty.
 function M.insert_row()
   if not editable_or_complain() then
     return
@@ -1270,8 +1236,7 @@ function M.insert_row()
       label_w = math.max(label_w, vim.fn.strdisplaywidth(c.name))
     end
 
-    -- static part: right-aligned label + separator per line, type hints
-    -- pinned to the right edge
+    -- static part: right-aligned label, type hints pinned right
     local ns = vim.api.nvim_create_namespace("sqledit_insert_form")
     for i, c in ipairs(table_cols) do
       local hints = { c.type }
@@ -1447,10 +1412,7 @@ function M.edit_cells()
   start_edit(rows, col)
 end
 
----Set the cell under the cursor (or every cell of the visual block) to
----NULL without going through the input: one UPDATE, `SET a = NULL,
----b = NULL` for all spanned columns across the selected rows. Confirmed
----when more than one cell is touched or on prod.
+---NULL the cursor cell or the visual block in one UPDATE; confirmed for >1 cell or on prod.
 function M.null_cells()
   if not editable_or_complain() then
     return

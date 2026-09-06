@@ -12,8 +12,7 @@ import (
 	"github.com/Laischor/nvim-sql/internal/config"
 )
 
-// client drives a Server over pipes and waits for each response — the same
-// request/response sequencing the Lua frontend uses.
+// client drives a Server over pipes, one request/response at a time like the Lua frontend.
 type client struct {
 	in   io.WriteCloser
 	out  *bufio.Scanner
@@ -266,6 +265,107 @@ func TestSQLiteEndToEnd(t *testing.T) {
 	res = c.call(t, "connections.active", nil)
 	if n := len(res["connections"].([]any)); n != 0 {
 		t.Fatalf("connections.active after disconnect: %d entries", n)
+	}
+}
+
+func TestSQLiteScriptAndTransactions(t *testing.T) {
+	c := newClient(t, sqliteConfig(t))
+	res := c.call(t, "connect", map[string]any{"server": "testdb"})
+	connID := res["id"].(string)
+	age := func() float64 {
+		t.Helper()
+		r := c.call(t, "query", map[string]any{"id": connID, "sql": "SELECT age FROM users WHERE name = 'alice'"})
+		return r["rows"].([]any)[0].([]any)[0].(float64)
+	}
+
+	// script: statements run in order, every result comes back, no tx afterwards
+	res = c.call(t, "script", map[string]any{"id": connID, "sql": `
+		CREATE TABLE users (id integer primary key, name text, age int);
+		INSERT INTO users (name, age) VALUES ('alice', 30), ('bob', 40); -- seed
+		SELECT name FROM users ORDER BY id;`})
+	results := res["results"].([]any)
+	if len(results) != 3 || res["failed"] != nil || res["tx"] != false {
+		t.Fatalf("script: %v", res)
+	}
+	if results[1].(map[string]any)["rows_affected"].(float64) != 2 {
+		t.Fatalf("script insert: %v", results[1])
+	}
+	last := results[2].(map[string]any)
+	if len(last["rows"].([]any)) != 2 || last["sql"] != "SELECT name FROM users ORDER BY id" {
+		t.Fatalf("script select: %v", last)
+	}
+
+	// failure mid-script: earlier results kept, failed carries index + message
+	res = c.call(t, "script", map[string]any{"id": connID,
+		"sql": "SELECT 1 AS a; SELEC nope; SELECT 2"})
+	failed := res["failed"].(map[string]any)
+	if len(res["results"].([]any)) != 1 || failed["index"].(float64) != 2 || failed["sql"] != "SELEC nope" || failed["message"] == "" {
+		t.Fatalf("script failure: %v", res)
+	}
+
+	// explicit begin/commit/rollback
+	if r := c.call(t, "begin", map[string]any{"id": connID}); r["tx"] != true {
+		t.Fatalf("begin: %v", r)
+	}
+	c.callErr(t, "begin", map[string]any{"id": connID})
+	res = c.call(t, "query", map[string]any{"id": connID, "sql": "UPDATE users SET age = 31 WHERE name = 'alice'"})
+	if res["tx"] != true || age() != 31 {
+		t.Fatalf("update in tx: %v", res)
+	}
+	if r := c.call(t, "rollback", map[string]any{"id": connID}); r["tx"] != false {
+		t.Fatalf("rollback: %v", r)
+	}
+	if age() != 30 {
+		t.Fatalf("rollback not applied: %v", age())
+	}
+	c.callErr(t, "commit", map[string]any{"id": connID})
+	c.callErr(t, "rollback", map[string]any{"id": connID})
+
+	c.call(t, "begin", map[string]any{"id": connID})
+	c.call(t, "query", map[string]any{"id": connID, "sql": "UPDATE users SET age = 32 WHERE name = 'alice'"})
+	// batch inside an open transaction: savepoint, failure leaves the outer tx intact
+	res = c.call(t, "batch", map[string]any{"id": connID, "statements": []any{
+		map[string]any{"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{"50", "bob"}},
+	}})
+	if res["tx"] != true {
+		t.Fatalf("batch in tx: %v", res)
+	}
+	c.callErr(t, "batch", map[string]any{"id": connID, "statements": []any{
+		map[string]any{"sql": "UPDATE users SET age = ? WHERE name = ?", "params": []any{"99", "alice"}},
+		map[string]any{"sql": "UPDATE nope SET x = 1"},
+	}})
+	if age() != 32 {
+		t.Fatalf("savepoint rollback: %v", age())
+	}
+	if r := c.call(t, "commit", map[string]any{"id": connID}); r["tx"] != false {
+		t.Fatalf("commit: %v", r)
+	}
+	if age() != 32 {
+		t.Fatalf("commit not applied: %v", age())
+	}
+	res = c.call(t, "query", map[string]any{"id": connID, "sql": "SELECT age FROM users WHERE name = 'bob'"})
+	if res["rows"].([]any)[0].([]any)[0].(float64) != 50 {
+		t.Fatalf("batch in tx not committed: %v", res["rows"])
+	}
+
+	// BEGIN typed in a script leaves the transaction open for later calls
+	res = c.call(t, "script", map[string]any{"id": connID,
+		"sql": "BEGIN; UPDATE users SET age = 33 WHERE name = 'alice';"})
+	if res["tx"] != true {
+		t.Fatalf("script begin: %v", res)
+	}
+	res = c.call(t, "query", map[string]any{"id": connID, "sql": "COMMIT"})
+	if res["tx"] != false || age() != 33 {
+		t.Fatalf("typed commit: %v age=%v", res, age())
+	}
+
+	// disconnect with an open transaction rolls it back
+	c.call(t, "begin", map[string]any{"id": connID})
+	c.call(t, "query", map[string]any{"id": connID, "sql": "UPDATE users SET age = 99 WHERE name = 'alice'"})
+	c.call(t, "disconnect", map[string]any{"id": connID})
+	c.call(t, "connect", map[string]any{"server": "testdb"})
+	if age() != 33 {
+		t.Fatalf("disconnect did not roll back: %v", age())
 	}
 }
 

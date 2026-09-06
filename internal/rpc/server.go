@@ -1,6 +1,4 @@
-// Package rpc implements newline-delimited JSON-RPC 2.0 over stdio.
-// One request per line in, one response per line out. Requests are handled
-// concurrently so a slow query never blocks a picker.
+// Package rpc implements newline-delimited JSON-RPC 2.0 over stdio; requests run concurrently.
 package rpc
 
 import (
@@ -8,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -34,6 +33,17 @@ type response struct {
 	ID      any       `json:"id"`
 	Result  any       `json:"result,omitempty"`
 	Error   *rpcError `json:"error,omitempty"`
+}
+
+// tx flags whether the connection has a transaction open after the call
+type queryResponse struct {
+	*db.Result
+	Tx bool `json:"tx"`
+}
+
+type scriptResponse struct {
+	*db.ScriptResult
+	Tx bool `json:"tx"`
 }
 
 type connInfo struct {
@@ -199,8 +209,7 @@ func (s *Server) dispatch(req *request) (any, error) {
 		if p.MaxRows <= 0 {
 			p.MaxRows = 500
 		}
-		// only text params: servers cast text to the column type, which
-		// avoids client-side type guessing (and float64 from JSON numbers)
+		// text params only: servers cast, no client-side type guessing
 		for i, v := range p.Params {
 			switch v.(type) {
 			case string, nil:
@@ -212,7 +221,61 @@ func (s *Server) dispatch(req *request) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return conn.Query(ctx, p.SQL, p.Params, p.MaxRows)
+		res, err := conn.Query(ctx, p.SQL, p.Params, p.MaxRows)
+		if err != nil {
+			return nil, err
+		}
+		return queryResponse{Result: res, Tx: conn.InTx()}, nil
+
+	case "script":
+		var p struct {
+			ID      string `json:"id"`
+			SQL     string `json:"sql"`
+			MaxRows int    `json:"max_rows"`
+		}
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return nil, err
+		}
+		if p.MaxRows <= 0 {
+			p.MaxRows = 500
+		}
+		conn, err := s.conn(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		res, err := conn.Script(ctx, p.SQL, p.MaxRows)
+		if err != nil {
+			return nil, err
+		}
+		return scriptResponse{ScriptResult: res, Tx: conn.InTx()}, nil
+
+	case "begin", "commit", "rollback":
+		var p struct {
+			ID string `json:"id"`
+		}
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return nil, err
+		}
+		conn, err := s.conn(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		switch req.Method {
+		case "begin":
+			err = conn.Begin(ctx)
+		case "commit":
+			err = conn.Commit(ctx)
+		default:
+			err = conn.Rollback(ctx)
+		}
+		var warn db.TxWarning
+		if errors.As(err, &warn) {
+			return map[string]any{"tx": conn.InTx(), "message": string(warn)}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"tx": conn.InTx()}, nil
 
 	case "batch":
 		var p struct {
@@ -242,7 +305,7 @@ func (s *Server) dispatch(req *request) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"rows_affected": affected}, nil
+		return map[string]any{"rows_affected": affected, "tx": conn.InTx()}, nil
 
 	case "objects":
 		var p struct {
