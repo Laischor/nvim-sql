@@ -176,7 +176,9 @@ local function sync_header_scroll()
     return vim.fn.winsaveview().leftcol
   end)
   vim.api.nvim_win_call(state.header_win, function()
-    vim.fn.winrestview({ topline = 1, lnum = 1, leftcol = leftcol })
+    if vim.fn.winsaveview().leftcol ~= leftcol then
+      vim.fn.winrestview({ topline = 1, lnum = 1, leftcol = leftcol })
+    end
   end)
 end
 
@@ -229,11 +231,8 @@ local function ensure_windows()
   vim.wo[state.header_win].winbar = ""
 
   local group = vim.api.nvim_create_augroup("sqledit_grid_win", { clear = true })
-  vim.api.nvim_create_autocmd("WinScrolled", {
-    group = group,
-    pattern = tostring(state.win),
-    callback = sync_header_scroll,
-  })
+  -- no window pattern: it would only match the first window scrolled in a batch (e.g. after a resize)
+  vim.api.nvim_create_autocmd("WinScrolled", { group = group, callback = sync_header_scroll })
   -- one window of the pair closes -> take the other with it
   vim.api.nvim_create_autocmd("WinClosed", {
     group = group,
